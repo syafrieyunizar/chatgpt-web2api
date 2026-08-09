@@ -216,6 +216,25 @@ def _get_requirements_token(config):
 
 # ─── Token Management ────────────────────────────────────────────────────────
 
+# Cached access token. Re-populated on 401 via refresh_token (if configured).
+_cached_access_token = None
+
+
+class TokenExpiredError(RuntimeError):
+    """ChatGPT rejected the access token (HTTP 401). Triggers auto-refresh."""
+
+
+class RetryableError(RuntimeError):
+    """Transient upstream failure (429, 5xx, timeout) worth retrying.
+
+    status: HTTP status that caused it (0 = transport/network error).
+    """
+
+    def __init__(self, status: int, msg: str):
+        super().__init__(msg)
+        self.status = status
+
+
 def refresh_token_to_access(refresh_token: str) -> str:
     url = "https://auth0.openai.com/oauth/token"
     data = {
@@ -230,20 +249,43 @@ def refresh_token_to_access(refresh_token: str) -> str:
         r.raise_for_status()
         token = r.json()["access_token"]
         session.close()
+        log("Access token refreshed OK")
         return token
     except Exception as e:
         log(f"Token refresh failed: {e}")
         raise
 
 
-def get_access_token():
+def get_access_token(force_refresh: bool = False):
+    """Return cached access token; refresh from refresh_token when asked.
+
+    Priority:
+      1. Cached token (unless force_refresh)
+      2. refresh_token in config (exchange → cache)
+      3. access_token in config (use as-is)
+    """
+    global _cached_access_token
+    if not force_refresh and _cached_access_token:
+        return _cached_access_token
+
     at = CONFIG.get("access_token")
-    if at:
-        return at
     rt = CONFIG.get("refresh_token")
+
+    if force_refresh and rt:
+        _cached_access_token = refresh_token_to_access(rt)
+        return _cached_access_token
+    if at:
+        _cached_access_token = at
+        return _cached_access_token
     if rt:
-        return refresh_token_to_access(rt)
+        _cached_access_token = refresh_token_to_access(rt)
+        return _cached_access_token
     return None
+
+
+def is_retryable_status(status: int) -> bool:
+    """True if the upstream HTTP status is worth retrying."""
+    return status == 429 or 500 <= status <= 599
 
 
 # ─── ChatGPT Backend ─────────────────────────────────────────────────────────
@@ -304,13 +346,22 @@ def get_chat_requirements(session, access_token):
     p = _get_requirements_token(config)
 
     r = session.post(url, headers=headers, json={"p": p}, timeout=15)
+    if r.status_code == 401:
+        raise TokenExpiredError("chat-requirements: 401 unauthorized (token expired)")
+    if is_retryable_status(r.status_code):
+        raise RetryableError(r.status_code, f"chat-requirements: HTTP {r.status_code}")
     if r.status_code != 200:
         raise RuntimeError(f"chat-requirements failed: {r.status_code} {r.text[:300]}")
     return r.json(), config
 
 
-def send_conversation(session, access_token, chat_token, proof_token, messages, model_slug, oai_device_id):
-    """POST /backend-api/conversation with SSE streaming. Yields SSE lines."""
+def open_conversation(session, access_token, chat_token, proof_token, messages, model_slug, oai_device_id):
+    """POST /backend-api/conversation (stream=True). Returns the response object.
+
+    Raises TokenExpiredError on 401, RetryableError on 429/5xx, RuntimeError otherwise.
+    The response body is NOT consumed here — caller iterates resp.iter_lines().
+    Splitting open vs read lets us retry/refresh before any SSE bytes go to the client.
+    """
     url = CONFIG["host_url"] + "/backend-api/conversation"
     headers = _base_headers(access_token)
     headers["accept"] = "text/event-stream"
@@ -367,12 +418,52 @@ def send_conversation(session, access_token, chat_token, proof_token, messages, 
     }
 
     resp = session.post(url, headers=headers, json=body, timeout=CONFIG["request_timeout_sec"], stream=True)
+    if resp.status_code == 401:
+        resp.close()
+        raise TokenExpiredError("conversation: 401 unauthorized (token expired)")
+    if is_retryable_status(resp.status_code):
+        resp.close()
+        raise RetryableError(resp.status_code, f"conversation: HTTP {resp.status_code}")
     if resp.status_code != 200:
         error_body = resp.text[:500] if hasattr(resp, 'text') else "unknown"
+        resp.close()
         raise RuntimeError(f"conversation failed: {resp.status_code} {error_body}")
+    return resp
 
-    for line in resp.iter_lines():
-        yield line
+
+def run_conversation(session, access_token, chat_token, proof_token, messages, model_slug, oai_device_id, retry_attempts=None, retry_delay=None):
+    """Open the conversation with retry-on-transient errors.
+
+    Returns a response whose iter_lines() yields the SSE stream. Caller consumes it.
+    TokenExpiredError (401) is intentionally NOT handled here — it propagates so the
+    caller can refresh the access token and redo the whole pipeline (fresh chat token too).
+    """
+    attempts = retry_attempts if retry_attempts is not None else CONFIG.get("retry_attempts", 3)
+    delay = retry_delay if retry_delay is not None else CONFIG.get("retry_delay_sec", 2)
+
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            return open_conversation(session, access_token, chat_token, proof_token, messages, model_slug, oai_device_id)
+        except RetryableError as e:
+            last_err = e
+            if attempt < attempts - 1:
+                log(f"Transient error (HTTP {e.status}), retry {attempt + 1}/{attempts}")
+                time.sleep(delay)
+                continue
+            raise
+        except Exception as e:
+            if isinstance(e, TokenExpiredError):
+                raise  # let the caller handle 401/refresh
+            last_err = e
+            # Retry transport-level errors (network drop, timeout) too.
+            if attempt < attempts - 1:
+                log(f"Transport error, retry {attempt + 1}/{attempts}: {e}")
+                time.sleep(delay)
+                continue
+            raise
+
+    raise last_err if last_err else RuntimeError("conversation failed")
 
 
 # ─── SSE Parsing ─────────────────────────────────────────────────────────────
@@ -597,34 +688,77 @@ class ChatGPTHandler(BaseHTTPRequestHandler):
         session = _make_session()
 
         try:
-            # Step 1: Load page for cookies
-            init_page_cookies(session)
-
-            # Step 2: Get chat requirements
-            req_data, pow_config = get_chat_requirements(session, access_token)
-            chat_token = req_data.get("token")
-            if not chat_token:
-                self.send_json({"error": {"message": "No chat token", "detail": str(req_data)[:300]}}, 403)
-                return
-
-            # Step 3: Solve PoW
-            proof_token = None
-            pow_data = req_data.get("proofofwork", {})
-            if pow_data.get("required"):
-                pow_seed = pow_data.get("seed", "")
-                pow_diff = pow_data.get("difficulty", CONFIG["pow_difficulty"])
-                log(f"PoW: seed={pow_seed[:20]}... diff={pow_diff}")
-                proof_token, solved = _get_answer_token(pow_seed, pow_diff, pow_config)
-                log(f"PoW solved: {solved}")
-            else:
-                log("PoW not required")
-
-            # Step 4: Send conversation
+            # Retry loop covers the whole pipeline: 401 → auto-refresh token & redo;
+            # transient errors (429/5xx) → backoff & redo.
+            attempts = CONFIG.get("retry_attempts", 3)
+            delay = CONFIG.get("retry_delay_sec", 2)
+            last_err = None
+            resp = None
             oai_device_id = str(uuid.uuid4())
-            sse_lines = send_conversation(
-                session, access_token, chat_token, proof_token,
-                messages, model_slug, oai_device_id,
-            )
+            for attempt in range(attempts):
+                try:
+                    # Step 1: Load page for cookies
+                    init_page_cookies(session)
+
+                    # Step 2: Get chat requirements
+                    req_data, pow_config = get_chat_requirements(session, access_token)
+                    chat_token = req_data.get("token")
+                    if not chat_token:
+                        raise RuntimeError(f"No chat token: {str(req_data)[:300]}")
+
+                    # Step 3: Solve PoW
+                    proof_token = None
+                    pow_data = req_data.get("proofofwork", {})
+                    if pow_data.get("required"):
+                        pow_seed = pow_data.get("seed", "")
+                        pow_diff = pow_data.get("difficulty", CONFIG["pow_difficulty"])
+                        log(f"PoW: seed={pow_seed[:20]}... diff={pow_diff}")
+                        proof_token, solved = _get_answer_token(pow_seed, pow_diff, pow_config)
+                        log(f"PoW solved: {solved}")
+                    else:
+                        log("PoW not required")
+
+                    # Step 4: Send conversation (retry + 401-refresh inside)
+                    resp = run_conversation(
+                        session, access_token, chat_token, proof_token,
+                        messages, model_slug, oai_device_id,
+                        retry_attempts=1, retry_delay=delay,
+                    )
+                    break
+                except TokenExpiredError as e:
+                    # 401 anywhere in the pipeline → refresh token once, redo everything.
+                    if CONFIG.get("refresh_token"):
+                        log("401 → refreshing access token via refresh_token")
+                        try:
+                            access_token = get_access_token(force_refresh=True)
+                        except Exception as re:
+                            raise RuntimeError(f"token refresh failed: {re}") from e
+                        log("Token refreshed, restarting pipeline")
+                        continue  # redo from step 1 with new token
+                    self.send_json({
+                        "error": {"message": "access token expired and no refresh_token configured — update config.json"},
+                        "hint": "Get a fresh accessToken from https://chatgpt.com/api/auth/session, or set refresh_token",
+                    }, 401)
+                    return
+                except RetryableError as e:
+                    last_err = e
+                    if attempt < attempts - 1:
+                        log(f"Transient error (HTTP {e.status}), retry {attempt + 1}/{attempts}")
+                        time.sleep(delay)
+                        continue
+                    raise
+                except Exception as e:
+                    last_err = e
+                    if attempt < attempts - 1:
+                        log(f"Pipeline error, retry {attempt + 1}/{attempts}: {e}")
+                        time.sleep(delay)
+                        continue
+                    raise
+
+            if resp is None:
+                raise last_err if last_err else RuntimeError("pipeline failed")
+
+            sse_lines = resp.iter_lines()
 
             if stream:
                 self.send_response(200)
