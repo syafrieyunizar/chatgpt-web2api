@@ -11,7 +11,7 @@ Direct reverse-engineered approach — no browser automation, no Playwright.
 - **Cloudflare Bypass**: Safari TLS fingerprint via `curl_cffi`
 - **Streaming**: SSE streaming support
 - **Token Auth**: Access token or refresh token
-- **API Key Auth**: Protect your endpoint with `api_keys` (e.g. `sk-chatgpt`)
+- **API Key Auth**: Protect your endpoint with `api_keys`
 - **systemd Service**: Auto-start & auto-restart included
 
 ## Quick Start
@@ -32,7 +32,7 @@ Create `config.json` (copy from `config.example.json`):
   "port": 6970,
   "host": "0.0.0.0",
   "default_model": "gpt-5.6-luna",
-  "api_keys": ["sk-chatgpt"],
+  "api_keys": ["sk-your-key-here"],
   "access_token": "eyJhbGciOi...your ChatGPT access token...",
   "refresh_token": null,
   "impersonate": "safari15_3"
@@ -68,18 +68,17 @@ curl http://localhost:6970/health
 > **Penting:** `config.json` berisi token akun ChatGPT kamu — JANGAN pernah di-commit ke git
 > (sudah otomatis di-`gitignore`). Cuma `config.example.json` (template kosong) yang aman di-push.
 
-## Ganti API Key Default (`sk-chatgpt`) jadi Random
+## Ganti API Key Default jadi Random
 
 API key (`api_keys` di config) adalah **kunci akses publik** ke instance kamu — siapa pun yang
-punya key ini bisa memakai akun ChatGPT kamu. Ganti dari default `sk-chatgpt` ke key random
-yang cuma kamu tahu.
+punya key ini bisa memakai akun ChatGPT kamu. Ganti dari default ke key random yang cuma kamu tahu.
 
 ### Cara generate key random 24 karakter
 
 **Opsi 1 — Python (rekomendasi):**
 ```bash
 python3 -c "import secrets,string; print('sk-' + ''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(24)))"
-# contoh output: sk-K3jF9xL2mV7qRt8WaZb4Yp1Q
+# contoh output: sk-K3j...Yp1Q
 ```
 
 **Opsi 2 — OpenSSL:**
@@ -103,23 +102,47 @@ Ubah bagian `api_keys`:
 
 ```json
 {
-  "api_keys": ["sk-K3jF9xL2mV7qRt8WaZb4Yp1Q"]
+  "api_keys": ["sk-K3j...Yp1Q"]
 }
 ```
 
 > Boleh lebih dari satu key, pisahkan dengan koma:
 > `"api_keys": ["sk-AAA...", "sk-BBB..."]` — semua key yang terdaftar bisa dipakai.
 
-Restart & tes:
+### Restart & tes
 
 ```bash
 systemctl --user restart chatgpt-web2api
-curl http://localhost:6970/v1/models -H "Authorization: Bearer ***
-# ↑ ganti sk-chatgpt dengan key baru kamu
+curl http://localhost:6970/v1/models -H "Authorization: Bearer <YOUR_API_KEY>" # ganti <YOUR_API_KEY> dengan key baru kamu
 ```
 
 > **Jangan pakai `-d '{"model":...}'` untuk tes auth** — cukup `/v1/models` yang juga butuh key.
 > Tanpa key yang benar akan ditolak `401 invalid api key`.
+
+### Verifikasi key aktif (setelah ganti)
+
+```bash
+# 1. Restart service biar config kebaca ulang
+systemctl --user restart chatgpt-web2api
+
+# 2. Tes pakai key baru → harusnya HTTP 200
+curl -s -o /dev/null -w "HTTP %{http_code}\n" \
+  http://localhost:6970/v1/models \
+  -H "Authorization: Bearer <YOUR_API_KEY>"
+
+# 3. Tes pakai key LAMA → harusnya HTTP 401 (sudah mati)
+curl -s -o /dev/null -w "HTTP %{http_code}\n" \
+  http://localhost:6970/v1/models \
+  -H "Authorization: Bearer <YOUR_API_KEY>"
+```
+
+| Respons | Arti |
+|---|---|
+| `HTTP 200` | Key valid, API aktif |
+| `HTTP 401` | Key salah / sudah tidak terdaftar di `api_keys` |
+
+> **Penting:** Setelah key diganti di `config.json` + restart, **key lama langsung tidak berlaku**.
+> Semua client yang masih pakai key lama harus di-update ke key baru.
 
 ## How to get tokens
 
@@ -139,7 +162,7 @@ curl http://localhost:6970/v1/models -H "Authorization: Bearer ***
 | Field | Value |
 |-------|-------|
 | Base URL | `http://<host>:6970/v1` |
-| API Key | `sk-chatgpt` (or whatever you set in `api_keys`; anything if empty) |
+| API Key | whatever you set in `api_keys`; anything if empty |
 | Model | `gpt-5.6-luna`, `gpt-5.5`, `gpt-4o`, `o3-mini`, etc. |
 
 ### curl
@@ -148,13 +171,13 @@ curl http://localhost:6970/v1/models -H "Authorization: Bearer ***
 # Non-streaming
 curl http://localhost:6970/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-chatgpt" \
+  -H "Authorization: Bearer <YOUR_API_KEY>" \
   -d '{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"Hello!"}]}'
 
 # Streaming
 curl http://localhost:6970/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-chatgpt" \
+  -H "Authorization: Bearer <YOUR_API_KEY>" \
   -d '{"model":"gpt-5.6-luna","stream":true,"messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
@@ -162,7 +185,7 @@ curl http://localhost:6970/v1/chat/completions \
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:6970/v1", api_key="sk-chatgpt")
+client = OpenAI(base_url="http://localhost:6970/v1", api_key="<YOUR_API_KEY>")
 resp = client.chat.completions.create(
     model="gpt-5.6-luna",
     messages=[{"role": "user", "content": "Explain quantum computing"}]
