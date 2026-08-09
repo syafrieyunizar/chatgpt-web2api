@@ -45,7 +45,83 @@ Or use CLI:
 python chatgpt_web2api.py --access-token "eyJ..." --port 6970
 ```
 
-### How to get tokens
+## Edit config via SSH / Termius
+
+```bash
+# 1. Masuk ke folder repo
+cd ~/chatgpt-web2api
+
+# 2. Kalau config.json belum ada (clone fresh), buat dulu dari template
+cp config.example.json config.json
+
+# 3. Edit file — pilih salah satu editor
+nano config.json        # paling gampang (Ctrl+X → Y → Enter untuk simpan)
+# vi config.json        # atau pakai vim kalau sudah biasa
+
+# 4. Restart service supaya perubahan terbaca
+systemctl --user restart chatgpt-web2api
+
+# 5. Verifikasi
+curl http://localhost:6970/health
+```
+
+> **Penting:** `config.json` berisi token akun ChatGPT kamu — JANGAN pernah di-commit ke git
+> (sudah otomatis di-`gitignore`). Cuma `config.example.json` (template kosong) yang aman di-push.
+
+## Ganti API Key Default (`sk-chatgpt`) jadi Random
+
+API key (`api_keys` di config) adalah **kunci akses publik** ke instance kamu — siapa pun yang
+punya key ini bisa memakai akun ChatGPT kamu. Ganti dari default `sk-chatgpt` ke key random
+yang cuma kamu tahu.
+
+### Cara generate key random 24 karakter
+
+**Opsi 1 — Python (rekomendasi):**
+```bash
+python3 -c "import secrets,string; print('sk-' + ''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(24)))"
+# contoh output: sk-K3jF9xL2mV7qRt8WaZb4Yp1Q
+```
+
+**Opsi 2 — OpenSSL:**
+```bash
+echo "sk-$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 24)"
+```
+
+**Opsi 3 — /dev/urandom:**
+```bash
+echo "sk-$(cat /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 24)"
+```
+
+### Pasang key baru ke config
+
+```bash
+cd ~/chatgpt-web2api
+nano config.json
+```
+
+Ubah bagian `api_keys`:
+
+```json
+{
+  "api_keys": ["sk-K3jF9xL2mV7qRt8WaZb4Yp1Q"]
+}
+```
+
+> Boleh lebih dari satu key, pisahkan dengan koma:
+> `"api_keys": ["sk-AAA...", "sk-BBB..."]` — semua key yang terdaftar bisa dipakai.
+
+Restart & tes:
+
+```bash
+systemctl --user restart chatgpt-web2api
+curl http://localhost:6970/v1/models -H "Authorization: Bearer ***
+# ↑ ganti sk-chatgpt dengan key baru kamu
+```
+
+> **Jangan pakai `-d '{"model":...}'` untuk tes auth** — cukup `/v1/models` yang juga butuh key.
+> Tanpa key yang benar akan ditolak `401 invalid api key`.
+
+## How to get tokens
 
 #### Access Token
 
