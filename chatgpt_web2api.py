@@ -75,19 +75,24 @@ CONFIG = dict(DEFAULT_CONFIG)
 # ─── Models ──────────────────────────────────────────────────────────────────
 
 MODELS = {
-    "gpt-4o":             {"slug": "gpt-4o",             "desc": "GPT-4o"},
-    "gpt-4o-mini":        {"slug": "gpt-4o-mini",        "desc": "GPT-4o Mini (fast)"},
-    "gpt-4":              {"slug": "gpt-4",              "desc": "GPT-4 (legacy)"},
+    "gpt-5.6-luna":       {"slug": "gpt-5-6",      "desc": "GPT-5.6 Luna (latest, default)"},
+    "gpt-5.5":            {"slug": "gpt-5-5",      "desc": "GPT-5.5"},
+    "gpt-5.6-luna-mini":  {"slug": "gpt-5-6-mini", "desc": "GPT-5.6 Luna Mini"},
+    "gpt-5.5-mini":       {"slug": "gpt-5-5-mini", "desc": "GPT-5.5 Mini"},
+    "gpt-5.3-mini":       {"slug": "gpt-5-3-mini", "desc": "GPT-5.3 Mini"},
+    "gpt-5.4-t-mini":     {"slug": "gpt-5-4-t-mini","desc": "GPT-5.4 Thinking Mini"},
+    "gpt-4o":             {"slug": "gpt-4o",       "desc": "GPT-4o"},
+    "gpt-4o-mini":        {"slug": "gpt-4o-mini",  "desc": "GPT-4o Mini"},
+    "gpt-4":              {"slug": "gpt-4",        "desc": "GPT-4 (legacy)"},
     "gpt-3.5-turbo":     {"slug": "text-davinci-002-render-sha", "desc": "GPT-3.5 Turbo"},
-    "o1":                 {"slug": "o1",                 "desc": "o1 reasoning"},
-    "o1-mini":            {"slug": "o1-mini",            "desc": "o1-mini"},
-    "o1-preview":         {"slug": "o1-preview",         "desc": "o1-preview"},
-    "o3":                 {"slug": "o3",                 "desc": "o3 reasoning"},
-    "o3-mini":            {"slug": "o3-mini",            "desc": "o3-mini"},
-    "o3-mini-high":       {"slug": "o3-mini-high",       "desc": "o3-mini high"},
-    "gpt-4.5o":           {"slug": "gpt-4.5o",          "desc": "GPT-4.5o"},
-    "gpt-4o-canmore":     {"slug": "gpt-4o-canmore",     "desc": "GPT-4o Canmore"},
-    "auto":               {"slug": "auto",               "desc": "Auto model selection"},
+    "o1":                 {"slug": "o1",           "desc": "o1 reasoning"},
+    "o1-mini":            {"slug": "o1-mini",      "desc": "o1-mini"},
+    "o1-preview":         {"slug": "o1-preview",   "desc": "o1-preview"},
+    "o3":                 {"slug": "o3",           "desc": "o3 reasoning"},
+    "o3-mini":            {"slug": "o3-mini",      "desc": "o3-mini"},
+    "o3-mini-high":       {"slug": "o3-mini-high", "desc": "o3-mini high"},
+    "research":           {"slug": "research",     "desc": "Deep Research"},
+    "auto":               {"slug": "auto",         "desc": "Auto model selection"},
 }
 
 # ─── PoW (Proof of Work) ────────────────────────────────────────────────────

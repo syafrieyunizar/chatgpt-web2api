@@ -4,13 +4,14 @@
   "host_url": "https://chatgpt.com",
   "retry_attempts": 3,
   "retry_delay_sec": 2,
-  "request_timeout_sec": 180,
-  "default_model": "gpt-4o",
+  "request_timeout_sec": 120,
+  "default_model": "gpt-5.6-luna",
   "log_requests": true,
-  "api_keys": [],
+  "api_keys": ["sk-chatgpt"],
   "access_token": null,
   "refresh_token": null,
   "proxy": null,
-  "history_disabled": false,
-  "pow_difficulty": "0fffff"
+  "history_disabled": true,
+  "pow_difficulty": "0fffff",
+  "impersonate": "safari15_3"
 }
