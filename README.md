@@ -12,6 +12,7 @@ Direct reverse-engineered approach — no browser automation, no Playwright.
 - **Streaming**: SSE streaming support
 - **Token Auth**: Access token or refresh token
 - **API Key Auth**: Protect your endpoint with `api_keys`
+- **`set-key.sh` Helper**: Safe key/token rotation without breaking JSON
 - **systemd Service**: Auto-start & auto-restart included
 
 ## Quick Start
@@ -108,6 +109,36 @@ Ubah bagian `api_keys`:
 
 > Boleh lebih dari satu key, pisahkan dengan koma:
 > `"api_keys": ["sk-AAA...", "sk-BBB..."]` — semua key yang terdaftar bisa dipakai.
+
+### Ganti key dengan `set-key.sh` (disarankan, anti-rusak)
+
+Repo ini termasuk helper `set-key.sh` untuk mengganti key/token tanpa risiko merusak
+JSON (pakai Python `json`, bukan edit manual).
+
+```bash
+cd ~/chatgpt-web2api
+
+# Lihat konfigurasi (token disembunyikan)
+./set-key.sh --show
+
+# Ganti API key → restart otomatis
+./set-key.sh --api-key sk-NEWKEY --restart
+
+# Set beberapa key sekaligus
+./set-key.sh --api-key sk-A --api-key sk-B --restart
+
+# Ganti access / refresh token ChatGPT
+./set-key.sh --access-token eyJ... --refresh-token eyJ... --restart
+```
+
+Keuntungan dibanding edit `nano` manual:
+
+| | Edit nano manual | `set-key.sh` |
+|---|---|---|
+| Risiko JSON rusak | Tinggi | **Nol** |
+| Backup otomatis | Tidak | ✅ `.bak` |
+| Restart service | Manual | Opsi `--restart` |
+| Multi-key | Manual | Sekali perintah |
 
 ### Restart & tes
 
