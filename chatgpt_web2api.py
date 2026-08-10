@@ -30,6 +30,7 @@ import uuid
 import string
 import os
 import sys
+import io
 import argparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -47,6 +48,13 @@ try:
 except ImportError:
     HAS_PYBASE64 = False
     import base64 as pybase64
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+    Image = None
 
 __version__ = "1.0.0"
 
@@ -336,6 +344,326 @@ def init_page_cookies(session):
     return r.status_code
 
 
+# ─── File Upload ────────────────────────────────────────────────────────────
+
+MULTIMODAL_MIMES = {"image/jpeg", "image/webp", "image/png", "image/gif"}
+
+MY_FILES_MIMES = {
+    "text/x-php", "application/msword", "text/x-c", "text/html",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/json", "text/javascript", "application/pdf",
+    "text/x-java", "text/x-tex", "text/x-typescript", "text/x-sh",
+    "text/x-csharp", "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "text/x-c++", "application/x-latex", "text/markdown", "text/plain",
+    "text/x-ruby", "text/x-script.python",
+}
+
+MIME_EXT_MAP = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp", "application/pdf": ".pdf", "text/plain": ".txt",
+    "text/markdown": ".md", "application/json": ".json", "text/html": ".html",
+    "text/css": ".css", "text/xml": ".xml", "application/xml": ".xml",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "text/x-python": ".py", "text/x-script.python": ".py", "text/x-sh": ".sh",
+    "text/javascript": ".js", "text/x-java": ".java", "text/x-c": ".c",
+    "text/x-c++": ".cpp", "text/x-csharp": ".cs", "text/x-ruby": ".rb",
+    "text/x-tex": ".tex", "application/x-latex": ".latex",
+    "application/zip": ".zip", "application/x-zip-compressed": ".zip",
+    "application/x-tar": ".tar", "application/x-gzip": ".gz",
+    "audio/mpeg": ".mp3", "audio/wav": ".wav", "video/mp4": ".mp4",
+    "text/csv": ".csv", "application/rtf": ".rtf",
+}
+
+
+def _mime_from_name(filename):
+    ext = os.path.splitext(filename or "")[1].lower()
+    rev = {v: k for k, v in MIME_EXT_MAP.items() if v.startswith(ext)}
+    if rev:
+        return max(rev)  # longest matching extension (e.g. .docx over .doc)
+    return "application/octet-stream"
+
+
+def _get_file_extension(mime_type):
+    return MIME_EXT_MAP.get(mime_type, "")
+
+
+def _determine_use_case(mime_type):
+    if mime_type in MULTIMODAL_MIMES:
+        return "multimodal"
+    if mime_type in MY_FILES_MIMES:
+        return "my_files"
+    return "ace_upload"
+
+
+def _parse_data_url(data_url):
+    """data:<mime>;base64,<payload> → (bytes, mime)."""
+    m = re.match(r"data:([^;,]+)?(;base64)?,(.*)", data_url, re.S)
+    if not m:
+        return None, None
+    mime, is_b64, payload = m.group(1), m.group(2), m.group(3)
+    if is_b64:
+        return pybase64.b64decode(payload), (mime or "application/octet-stream")
+    return payload.encode("utf-8"), (mime or "text/plain")
+
+
+def _fetch_file_content(source, session):
+    """source = data: URL or http(s) URL → (bytes, mime_type)."""
+    if isinstance(source, str) and source.startswith("data:"):
+        content, mime = _parse_data_url(source)
+        if content is None:
+            raise RuntimeError("invalid data: URL in image_url")
+        return content, mime
+    r = session.get(source, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"failed to fetch file URL {source[:80]}: HTTP {r.status_code}")
+    mime = r.headers.get("Content-Type", "").split(";")[0].strip() or "application/octet-stream"
+    return r.content, mime
+
+
+def _get_image_size(file_content):
+    if not HAS_PIL:
+        raise RuntimeError("Pillow (pillow) required for image uploads — pip install pillow")
+    with Image.open(io.BytesIO(file_content)) as img:
+        return img.width, img.height
+
+
+# ─── Local File Parsing (fallback when upload/read is unavailable) ──────────
+
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".css", ".js",
+    ".py", ".sh", ".log", ".ini", ".yaml", ".yml", ".tex", ".rtf",
+}
+
+
+def _decode_bytes(file_content, mime_type):
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            return file_content.decode(enc)
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return file_content.decode("utf-8", errors="replace")
+
+
+def _extract_pdf_text(file_content):
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        try:
+            from PyPDF2 import PdfReader
+        except ImportError:
+            return None, "PDF parsing needs pypdf: pip install pypdf"
+    try:
+        reader = PdfReader(io.BytesIO(file_content))
+        pages = []
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            if t.strip():
+                pages.append(t.strip())
+    except Exception as e:
+        return None, f"PDF parse error: {e}"
+    if not pages:
+        return None, "PDF has no extractable text (scanned/image PDF not supported)"
+    return "\n\n".join(pages), None
+
+
+def _extract_docx_text(file_content):
+    try:
+        from docx import Document
+    except ImportError:
+        return None, "DOCX parsing needs python-docx: pip install python-docx"
+    try:
+        doc = Document(io.BytesIO(file_content))
+        parts = []
+        for p in doc.paragraphs:
+            if p.text.strip():
+                parts.append(p.text)
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                cells = [c.text.strip() for c in row.cells]
+                if any(cells):
+                    parts.append(" | ".join(cells))
+    except Exception as e:
+        return None, f"DOCX parse error: {e}"
+    if not parts:
+        return None, "DOCX has no extractable text"
+    return "\n".join(parts), None
+
+
+def _extract_xlsx_text(file_content):
+    try:
+        import openpyxl
+    except ImportError:
+        return None, "XLSX parsing needs openpyxl: pip install openpyxl"
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_content), read_only=True, data_only=True)
+        parts = []
+        for ws in wb.worksheets:
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(x.strip() for x in cells):
+                    rows.append("\t".join(cells))
+            if rows:
+                parts.append(f"[Sheet: {ws.title}]\n" + "\n".join(rows))
+    except Exception as e:
+        return None, f"XLSX parse error: {e}"
+    if not parts:
+        return None, "XLSX has no readable rows"
+    return "\n\n".join(parts), None
+
+
+def parse_file_text(file_content, mime_type, filename):
+    """Extract text from a file locally. Returns (text, error).
+
+    Images return (None, None) — they must go through the upload flow.
+    Unknown binaries return (None, "unsupported...").
+    """
+    if not file_content:
+        return None, "empty file"
+    mime = (mime_type or "").lower()
+    ext = os.path.splitext(filename or "")[1].lower()
+
+    if mime.startswith("image/"):
+        return None, None
+    if mime.startswith("text/") or ext in TEXT_EXTENSIONS:
+        return _decode_bytes(file_content, mime), None
+    if mime == "application/pdf" or ext == ".pdf":
+        return _extract_pdf_text(file_content)
+    if mime in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",) or ext == ".docx":
+        return _extract_docx_text(file_content)
+    if mime in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",) or ext == ".xlsx":
+        return _extract_xlsx_text(file_content)
+    if mime == "application/msword" or ext == ".doc":
+        return None, ".doc (old Word) not supported — convert to .docx or .pdf first"
+
+    # Unknown type: inline if it looks like readable text
+    try:
+        decoded = _decode_bytes(file_content, mime)
+        sample = decoded[:2000]
+        printable = sum(1 for ch in sample if ch.isprintable() or ch in "\n\t\r")
+        if sample and printable / len(sample) > 0.9:
+            return decoded, None
+    except Exception:
+        pass
+    return None, f"unsupported file type: {mime or ext or 'unknown'}"
+
+
+def _create_upload_url(session, access_token, file_name, file_size, use_case, oai_device_id):
+    url = CONFIG["host_url"] + "/backend-api/files"
+    headers = _base_headers(access_token)
+    headers["oai-device-id"] = oai_device_id
+    body = {
+        "file_name": file_name,
+        "file_size": file_size,
+        "reset_rate_limits": False,
+        "timezone_offset_min": -480,
+        "use_case": use_case,
+    }
+    r = session.post(url, headers=headers, json=body, timeout=15)
+    if r.status_code == 401:
+        raise TokenExpiredError("files: 401 unauthorized (token expired)")
+    if r.status_code != 200:
+        raise RuntimeError(f"files: HTTP {r.status_code} {r.text[:300]}")
+    res = r.json()
+    return res.get("file_id"), res.get("upload_url")
+
+
+def _upload_blob(session, upload_url, file_content, mime_type):
+    """Upload bytes to the presigned Azure Blob URL. No auth headers here."""
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "content-type": mime_type,
+        "x-ms-blob-type": "BlockBlob",
+        "x-ms-version": "2020-04-08",
+    }
+    r = session.put(upload_url, headers=headers, data=file_content, timeout=60)
+    if r.status_code != 201:
+        raise RuntimeError(f"blob upload: HTTP {r.status_code} {r.text[:300]}")
+
+
+def _register_upload(session, access_token, file_id):
+    """POST /files/{id}/uploaded — registers the blob upload so ChatGPT can find it."""
+    url = CONFIG["host_url"] + f"/backend-api/files/{file_id}/uploaded"
+    headers = _base_headers(access_token)
+    headers["oai-device-id"] = str(uuid.uuid4())
+    r = session.post(url, headers=headers, json={}, timeout=10)
+    if r.status_code == 401:
+        raise TokenExpiredError("files/uploaded: 401 unauthorized (token expired)")
+    if r.status_code != 200:
+        raise RuntimeError(f"files/uploaded: HTTP {r.status_code} {r.text[:300]}")
+    return r.json()
+
+
+def _confirm_upload(session, access_token, file_id):
+    """Poll /files/{id} until retrieval_index_status == success (non-image files)."""
+    url = CONFIG["host_url"] + f"/backend-api/files/{file_id}"
+    headers = _base_headers(access_token)
+    headers["oai-device-id"] = str(uuid.uuid4())
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            r = session.get(url, headers=headers, timeout=10)
+        except Exception as e:
+            log(f"File status poll error: {e}")
+            time.sleep(1)
+            continue
+        if r.status_code == 200:
+            res = r.json()
+            status = res.get("retrieval_index_status", "")
+            if status == "success":
+                log(f"File {file_id} indexed")
+                return True
+            if status == "failed":
+                log(f"File {file_id} indexing FAILED")
+                return False
+        time.sleep(1)
+    return False
+
+
+def upload_file(session, access_token, file_content, mime_type, oai_device_id):
+    """Full upload flow → file_meta dict (or None). Mirrors the ChatGPT web client."""
+    if not file_content or not mime_type:
+        return None
+
+    width = height = None
+    if mime_type.startswith("image/"):
+        try:
+            width, height = _get_image_size(file_content)
+        except Exception as e:
+            log(f"Image size unavailable, falling back to text/plain: {e}")
+            mime_type = "text/plain"
+
+    file_size = len(file_content)
+    file_name = f"{uuid.uuid4()}{_get_file_extension(mime_type)}"
+    use_case = _determine_use_case(mime_type)
+
+    file_id, upload_url = _create_upload_url(session, access_token, file_name, file_size, use_case, oai_device_id)
+    if not file_id or not upload_url:
+        raise RuntimeError("no file_id/upload_url from /files")
+
+    _upload_blob(session, upload_url, file_content, mime_type)
+
+    # Register the upload so ChatGPT can find the file
+    _register_upload(session, access_token, file_id)
+
+    # Confirm indexing for retrievable files (skip ace_upload — raw uploads don't index)
+    if use_case != "ace_upload":
+        _confirm_upload(session, access_token, file_id)
+
+    return {
+        "file_id": file_id,
+        "file_name": file_name,
+        "size_bytes": file_size,
+        "mime_type": mime_type,
+        "width": width,
+        "height": height,
+        "use_case": use_case,
+    }
+
+
 def get_chat_requirements(session, access_token):
     """POST /backend-api/sentinel/chat-requirements."""
     url = CONFIG["host_url"] + "/backend-api/sentinel/chat-requirements"
@@ -355,6 +683,23 @@ def get_chat_requirements(session, access_token):
     return r.json(), config
 
 
+def _upload_attachment(session, access_token, file_content, mime_type, oai_device_id, display_name=None):
+    """Upload a file via the /files flow → attachments entry dict."""
+    file_meta = upload_file(session, access_token, file_content, mime_type, oai_device_id)
+    if not file_meta:
+        raise RuntimeError("file upload failed")
+    att = {
+        "id": file_meta["file_id"],
+        "size": file_meta["size_bytes"],
+        "name": display_name or file_meta["file_name"],
+        "mime_type": file_meta["mime_type"],
+    }
+    if file_meta.get("width") is not None:
+        att["width"] = file_meta["width"]
+        att["height"] = file_meta["height"]
+    return att
+
+
 def open_conversation(session, access_token, chat_token, proof_token, messages, model_slug, oai_device_id):
     """POST /backend-api/conversation (stream=True). Returns the response object.
 
@@ -372,17 +717,93 @@ def open_conversation(session, access_token, chat_token, proof_token, messages, 
         headers["openai-sentinel-proof-token"] = proof_token
 
     chat_messages = []
+    file_mode = CONFIG.get("file_mode", "parse")
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if isinstance(content, list):
-            content = " ".join(c.get("text", "") for c in content if c.get("type") in ("text", "input_text"))
-        chat_messages.append({
-            "id": str(uuid.uuid4()),
-            "author": {"role": role},
-            "content": {"content_type": "text", "parts": [content]},
-            "metadata": {},
-        })
+            parts = []
+            attachments = []
+            for c in content:
+                ctype = c.get("type")
+                if ctype in ("text", "input_text"):
+                    parts.append(c.get("text", ""))
+                elif ctype == "image_url":
+                    img_url = c.get("image_url", {}).get("url")
+                    if not img_url:
+                        continue
+                    file_content, mime_type = _fetch_file_content(img_url, session)
+                    if file_mode == "parse" and not (mime_type or "").startswith("image/"):
+                        text, err = parse_file_text(file_content, mime_type, "")
+                        if text is not None:
+                            parts.append(f"[File attachment]\n{text.strip()}")
+                            log("Inlined non-image attachment via image_url (parse mode)")
+                            continue
+                        if err:
+                            log(f"Parse failed for image_url content: {err}")
+                    # image (or upload mode): real multimodal upload
+                    if (mime_type or "").startswith("image/"):
+                        file_meta = upload_file(session, access_token, file_content, mime_type, oai_device_id)
+                        if not file_meta:
+                            raise RuntimeError("image upload failed")
+                        fid = file_meta["file_id"]
+                        parts.append({
+                            "content_type": "image_asset_pointer",
+                            "asset_pointer": f"file-service://{fid}",
+                            "size_bytes": file_meta["size_bytes"],
+                            "width": file_meta.get("width"),
+                            "height": file_meta.get("height"),
+                        })
+                        att = {
+                            "id": fid,
+                            "size": file_meta["size_bytes"],
+                            "name": file_meta["file_name"],
+                            "mime_type": file_meta["mime_type"],
+                        }
+                        if file_meta.get("width") is not None:
+                            att["width"] = file_meta["width"]
+                            att["height"] = file_meta["height"]
+                        attachments.append(att)
+                    else:
+                        # non-image in upload mode
+                        attachments.append(_upload_attachment(
+                            session, access_token, file_content, mime_type, oai_device_id))
+                elif ctype in ("file", "input_file"):
+                    # {type: file, file: {file_data|file_url, filename}}
+                    finfo = c.get("file") or {}
+                    source = finfo.get("file_data") or finfo.get("file_url") or finfo.get("url")
+                    if not source:
+                        continue
+                    fname = finfo.get("filename") or ""
+                    file_content, mime_type = _fetch_file_content(source, session)
+                    if file_mode == "parse" and not (mime_type or "").startswith("image/"):
+                        text, err = parse_file_text(file_content, mime_type, fname)
+                        if text is not None:
+                            label = fname or "attachment"
+                            parts.append(f"[File: {label}]\n{text.strip()}")
+                            log(f"Inlined file {label} ({len(file_content)} bytes) as text")
+                            continue
+                        if err:
+                            log(f"Parse failed for {fname}: {err}")
+                    # upload mode / image / unparseable → real upload
+                    attachments.append(_upload_attachment(
+                        session, access_token, file_content, mime_type, oai_device_id, fname))
+            content_type = "multimodal_text" if len(attachments) else "text"
+            if not parts:
+                parts = [""]
+            chat_messages.append({
+                "id": str(uuid.uuid4()),
+                "author": {"role": role},
+                "content": {"content_type": content_type, "parts": parts},
+                "metadata": {"attachments": attachments} if attachments else {},
+            })
+        else:
+            chat_messages.append({
+                "id": str(uuid.uuid4()),
+                "author": {"role": role},
+                "content": {"content_type": "text", "parts": [content]},
+                "metadata": {},
+            })
 
     body = {
         "action": "next",

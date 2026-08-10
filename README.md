@@ -12,13 +12,15 @@ Direct reverse-engineered approach — no browser automation, no Playwright.
 - **Streaming**: SSE streaming support
 - **Token Auth**: Access token or refresh token
 - **API Key Auth**: Protect your endpoint with `api_keys`
+- **File Upload (parse mode)**: Send TXT/MD/CSV/JSON/PDF/DOCX/XLSX as `file` content — parsed locally & inlined as text (no account risk)
+- **Image Upload**: Images uploaded via ChatGPT's real `/files` flow (multimodal)
 - **`set-key.sh` Helper**: Safe key/token rotation without breaking JSON
 - **systemd Service**: Auto-start & auto-restart included
 
 ## Quick Start
 
 ```bash
-pip install curl_cffi pybase64
+pip install -r requirements.txt
 python chatgpt_web2api.py
 ```
 
@@ -224,6 +226,44 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+### File Upload (PDF, DOCX, TXT, dll)
+
+Kirim file dengan tipe konten `file` (data URL base64 atau URL http):
+
+```python
+import base64
+
+with open("lab.pdf", "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+
+resp = client.chat.completions.create(
+    model="gpt-5.6-luna",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Apa isi file ini?"},
+            {"type": "file", "file": {
+                "file_data": f"data:application/pdf;base64,{b64}",
+                "filename": "lab.pdf",
+            }},
+        ],
+    }],
+)
+print(resp.choices[0].message.content)
+```
+
+**Format yang didukung:**
+
+| Tipe | Cara diproses |
+|------|--------------|
+| TXT / MD / CSV / JSON / XML / HTML / kode | Parsed lokal → teks langsung |
+| PDF | Diekstrak teks via `pypdf` |
+| DOCX | Diekstrak via `python-docx` |
+| XLSX | Diekstrak via `openpyxl` |
+| PNG / JPG / WebP / GIF | Di-upload via flow ChatGPT (`/files`) untuk multimodal |
+
+> **Catatan:** `file_mode` default `"parse"` — file teks diekstrak di server dan disisipkan langsung ke prompt (tidak naik ke ChatGPT, jadi zero-risk ke akun). Set `"file_mode": "upload"` di `config.json` untuk memaksa semua file (termasuk teks) melewati flow upload ChatGPT.
+
 ## Available Models
 
 | Model | Description |
@@ -287,9 +327,23 @@ Logs: `journalctl --user -u chatgpt-web2api -f`
   "proxy": null,
   "history_disabled": true,
   "pow_difficulty": "0fffff",
-  "impersonate": "safari15_3"
+  "impersonate": "safari15_3",
+  "file_mode": "parse"
 }
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `port` | `6970` | HTTP port |
+| `host_url` | `https://chatgpt.com` | ChatGPT backend |
+| `api_keys` | `[]` | API keys to accept (empty = accept anything) |
+| `access_token` | `null` | ChatGPT access token |
+| `refresh_token` | `null` | ChatGPT refresh token (auto-renew) |
+| `proxy` | `null` | HTTP proxy |
+| `history_disabled` | `true` | Send `history_and_training_disabled` |
+| `pow_difficulty` | `0fffff` | PoW difficulty |
+| `impersonate` | `safari15_3` | curl_cffi TLS fingerprint |
+| `file_mode` | `parse` | `parse` = extract text locally; `upload` = upload to ChatGPT |
 
 ## Rate Limits & Limitations
 

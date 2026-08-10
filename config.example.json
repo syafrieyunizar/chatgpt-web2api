@@ -13,5 +13,6 @@
   "proxy": null,
   "history_disabled": true,
   "pow_difficulty": "0fffff",
-  "impersonate": "safari15_3"
+  "impersonate": "safari15_3",
+  "file_mode": "parse"
 }
