@@ -47,37 +47,56 @@ curl -X POST http://localhost:6970/v1/chat/completions \
 | Base URL | `http://localhost:6970/v1` |
 | API Key | Cek `config.json` field `api_key` |
 
-## Multiple Accounts
+## Manage Accounts
 
-Setiap akun = 1 config file = 1 port.
+Untuk **tambah akun**, **reset token**, **lihat status**, **stop server**, atau **hapus akun**:
 
 ```bash
-# Account A (port 6970)
-python3 chatgpt_web2api.py --config config-a.json &
-
-# Account B (port 6971)
-python3 chatgpt_web2api.py --config config-b.json &
-
-# Account C (port 6972)
-python3 chatgpt_web2api.py --config config-c.json &
+./manage.sh
 ```
 
-### Cara tambah akun baru:
+Menu yang tersedia:
 
-1. Copy config.json:
-   ```bash
-   cp config.json config-b.json
-   ```
+```
+╔══════════════════════════════════════════╗
+║   ChatGPT Web2API - Account Manager      ║
+╚══════════════════════════════════════════╝
 
-2. Edit `config-b.json`:
-   - Ganti `port` ke `6971`
-   - Ganti `api_key` ke key baru (atau generate: `python3 -c "import string,random; print('sk-'+''.join(random.choices(string.ascii_letters+string.digits,k=32)))"`)
-   - Ganti token dengan akun berbeda
+   1) ➕ Tambah akun baru
+   2) 🔄 Reset token akun existing
+   3) 📊 Lihat status semua server
+   4) ⛔ Stop semua server
+   5) 🗑️  Hapus akun
+   0) 🚪 Keluar
+```
 
-3. Jalankan:
-   ```bash
-   python3 chatgpt_web2api.py --config config-b.json &
-   ```
+### Tambah Akun Baru
+1. Run `./manage.sh` → pilih `1`
+2. Script auto-assign port berikutnya (6971, 6972, ...)
+3. Buka `https://chatgpt.com/api/auth/session` (login akun baru)
+4. Ctrl+A → Ctrl+C → Paste → Ctrl+D
+5. Server baru auto-start
+
+### Reset Token (Token Expired)
+1. Run `./manage.sh` → pilih `2`
+2. Pilih akun yang mau di-reset
+3. Buka `https://chatgpt.com/api/auth/session` (login akun itu)
+4. Ctrl+A → Ctrl+C → Paste → Ctrl+D
+5. Server restart dengan token baru
+
+### Lihat Status
+```bash
+./manage.sh
+# Pilih 3
+```
+Output:
+```
+CONFIG             PORT   ACCOUNT              API KEY               STATUS
+------             ----   -------              -------               ------
+config.json        6970   syaf.rie.yunz@gmail  sk-aBcDeFgHiJkLmNoP... 🟢 running
+config-a.json      6971   user2@gmail.com      sk-xYzWvUtSrQpOnMlK... 🟢 running
+config-b.json      6972   user3@gmail.com      sk-qWeRtYuIoPzXcVbN... 🔴 stopped
+```
 
 ## Config Format
 
