@@ -69,19 +69,35 @@ paste_and_parse() {
     
     echo ""
     echo -e "${C}┌──────────────────────────────────────────────┐${N}"
-    echo -e "${C}│  PASTE JSON HERE (paste, Enter, lalu Ctrl+D)  │${N}"
+    echo -e "${C}│  PASTE JSON (paste, lalu tunggu 3 detik)      │${N}"
+    echo -e "${C}│  ATAU: ./manage.sh /path/to/session.json      │${N}"
     echo -e "${C}└──────────────────────────────────────────────┘${N}"
     echo ""
     
     local tmp="/tmp/chatgpt_session_$$"
     
-    # Use Python to read stdin reliably (handles long paste without truncation)
+    # Read stdin with 3-second timeout (bypasses SSH 4096 byte paste limit)
     python3 -c "
-import sys
-data = sys.stdin.read()
+import sys, os, select
+
+chunks = []
+print('   Waiting for paste...', flush=True)
+while True:
+    ready, _, _ = select.select([sys.stdin], [], [], 3.0)
+    if ready:
+        chunk = os.read(0, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    else:
+        break
+
+data = b''.join(chunks).decode()
 with open('$tmp', 'w') as f:
     f.write(data)
-print(f'Read {len(data)} bytes')
+print(f'   Read {len(data)} bytes')
+if len(data) < 5000:
+    print('   WARNING: Data short (< 5000 bytes). Paste may be incomplete.')
 "
     
     python3 << EOF
@@ -96,7 +112,7 @@ script_dir = "$SCRIPT_DIR"
 with open(tmp, 'r') as f:
     raw = f.read().strip()
 
-# Parse JSON — handle long paste with possible whitespace
+# Parse JSON — handle truncated paste with regex fallback
 try:
     data = json.loads(raw)
 except json.JSONDecodeError:
@@ -104,29 +120,29 @@ except json.JSONDecodeError:
     first = raw.find('{')
     last = raw.rfind('}')
     if first != -1 and last != -1:
+        candidate = raw[first:last+1]
         try:
-            data = json.loads(raw[first:last+1])
-        except json.JSONDecodeError as e:
-            print(f"ERROR: Invalid JSON - {e}")
-            print(f"Input length: {len(raw)} chars")
-            sys.exit(1)
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            # Regex fallback: extract tokens directly
+            at_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', raw)
+            st_match = re.search(r'"sessionToken"\s*:\s*"([^"]+)"', raw)
+            name_match = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
+            exp_match = re.search(r'"expires"\s*:\s*"([^"]+)"', raw)
+            
+            if at_match:
+                data = {
+                    'accessToken': at_match.group(1),
+                    'sessionToken': st_match.group(1) if st_match else '',
+                    'user': {'name': name_match.group(1) if name_match else 'Unknown'},
+                    'expires': exp_match.group(1) if exp_match else 'Unknown'
+                }
+            else:
+                print(f"ERROR: Could not parse JSON")
+                print(f"Input: {len(raw)} chars, first 300: {raw[:300]}")
+                sys.exit(1)
     else:
         print("ERROR: No JSON object found")
-        sys.exit(1)
-
-# Parse JSON (handle raw or embedded in HTML)
-try:
-    data = json.loads(raw)
-except json.JSONDecodeError:
-    import re
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not match:
-        print("ERROR: No JSON found")
-        sys.exit(1)
-    try:
-        data = json.loads(match.group())
-    except json.JSONDecodeError as e:
-        print(f"ERROR: Invalid JSON - {e}")
         sys.exit(1)
 
 if 'accessToken' not in data:

@@ -1,9 +1,10 @@
 #!/bin/bash
 # ============================================
 # ChatGPT Web2API - One-Click Setup
-# Langkah 1: Run script ini
-# Langkah 2: Paste token dari chatgpt.com/api/auth/session
-# Selesai! Server jalan di localhost:6970
+# 
+# Cara pakai:
+#   ./setup.sh              → paste langsung di terminal
+#   ./setup.sh session.json → baca dari file (scp/nano)
 # ============================================
 
 set -e
@@ -37,24 +38,48 @@ echo -e "${Y}[2/4] Get your ChatGPT session token${N}"
 echo ""
 echo "   1. Buka browser: ${B}https://chatgpt.com/api/auth/session${N}"
 echo "   2. Login ke ChatGPT (kalau belum)"
-echo "   3. Halaman menampilkan JSON dengan WARNING_BANNER"
-echo "      abaikan banner, yang penting ada accessToken + sessionToken"
-echo "   4. ${Y}Ctrl+A${N} (select all) → ${Y}Ctrl+C${N} (copy)"
-echo "   5. Paste di bawah ini, lalu tekan ${Y}Enter${N} di baris kosong"
-echo ""
-echo -e "${G}┌──────────────────────────────────────────────┐${N}"
-echo -e "${G}│  PASTE JSON HERE (paste, Enter, lalu Ctrl+D)  │${N}"
-echo -e "${G}└──────────────────────────────────────────────┘${N}"
+echo "   3. ${Y}Ctrl+A${N} (select all) → ${Y}Ctrl+C${N} (copy)"
 echo ""
 
-# Use Python to capture stdin reliably (handles long lines, no cat truncation)
-python3 -c "
-import sys
-data = sys.stdin.read()
+# Check if file argument provided
+if [ -n "$1" ] && [ -f "$1" ]; then
+    cp "$1" "$SESSION_TMP"
+    echo -e "${G}   ✓ Reading from file: $1${N}"
+else
+    echo "   ${Y}Paste JSON di bawah ini (TIDAK perlu Ctrl+D)${N}"
+    echo "   Setelah paste, tunggu 3 detik → script auto-detect selesai"
+    echo ""
+    echo -e "${G}┌──────────────────────────────────────────────┐${N}"
+    echo -e "${G}│  PASTE JSON HERE (paste, lalu tunggu 3 detik) │${N}"
+    echo -e "${G}└──────────────────────────────────────────────┘${N}"
+    echo ""
+    
+    # Read stdin in a loop with timeout (bypasses SSH 4096 byte paste limit)
+    python3 -c "
+import sys, os, select
+
+chunks = []
+print('   Waiting for paste...', flush=True)
+while True:
+    ready, _, _ = select.select([sys.stdin], [], [], 3.0)
+    if ready:
+        chunk = os.read(0, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    else:
+        # 3 second timeout with no new data = paste complete
+        break
+
+data = b''.join(chunks).decode()
 with open('$SESSION_TMP', 'w') as f:
     f.write(data)
-print(f'Read {len(data)} bytes')
+print(f'   Read {len(data)} bytes')
+if len(data) < 5000:
+    print('   WARNING: Data seems short (< 5000 bytes). Paste may be incomplete.')
+    print('   Expected: ~6000+ bytes for full ChatGPT session JSON')
 "
+fi
 
 # ─── Step 3: Parse & generate config ─────────
 echo ""
@@ -70,35 +95,41 @@ script_dir = "$SCRIPT_DIR"
 with open(session_file, 'r') as f:
     raw = f.read().strip()
 
-# Parse JSON — handle cases where paste includes extra whitespace/newlines
+# Parse JSON — handle truncated paste, extra whitespace, HTML wrappers
 try:
     data = json.loads(raw)
 except json.JSONDecodeError:
-    # Try to extract JSON object using regex (handles embedded JSON)
     import re
-    # Find the outermost JSON object
-    match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw, re.DOTALL)
-    if not match:
-        # Try progressively: find from first { to last }
-        first = raw.find('{')
-        last = raw.rfind('}')
-        if first != -1 and last != -1:
-            try:
-                data = json.loads(raw[first:last+1])
-            except:
-                print("ERROR: Could not parse JSON from input")
-                print(f"Input length: {len(raw)} chars")
-                print(f"First 200 chars: {raw[:200]}")
-                sys.exit(1)
-        else:
-            print("ERROR: No JSON object found in input")
-            sys.exit(1)
-    else:
+    # Strategy 1: Find first { to last }
+    first = raw.find('{')
+    last = raw.rfind('}')
+    if first != -1 and last != -1:
+        candidate = raw[first:last+1]
         try:
-            data = json.loads(match.group())
-        except json.JSONDecodeError as e:
-            print(f"ERROR: Invalid JSON - {e}")
-            sys.exit(1)
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            # Strategy 2: Try to fix truncated JSON by finding what we can
+            # Look for accessToken and sessionToken with regex
+            at_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', raw)
+            st_match = re.search(r'"sessionToken"\s*:\s*"([^"]+)"', raw)
+            name_match = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
+            exp_match = re.search(r'"expires"\s*:\s*"([^"]+)"', raw)
+            
+            if at_match:
+                data = {
+                    'accessToken': at_match.group(1),
+                    'sessionToken': st_match.group(1) if st_match else '',
+                    'user': {'name': name_match.group(1) if name_match else 'Unknown'},
+                    'expires': exp_match.group(1) if exp_match else 'Unknown'
+                }
+            else:
+                print(f"ERROR: Could not parse JSON")
+                print(f"Input length: {len(raw)} chars")
+                print(f"First 300 chars: {raw[:300]}")
+                sys.exit(1)
+    else:
+        print("ERROR: No JSON object found in input")
+        sys.exit(1)
 
 # Validate
 if 'accessToken' not in data:
@@ -118,6 +149,11 @@ print(f"   ✓ User: {user_name}")
 print(f"   ✓ AccessToken: {len(access_token)} chars")
 print(f"   ✓ SessionToken: {len(refresh_token)} chars")
 print(f"   ✓ Expires: {expires}")
+
+if len(access_token) < 500:
+    print(f"   ⚠ WARNING: AccessToken seems short ({len(access_token)} chars)")
+if len(refresh_token) < 500:
+    print(f"   ⚠ WARNING: SessionToken seems short ({len(refresh_token)} chars)")
 
 # Generate random API key
 api_key = "sk-" + ''.join(random.choices(string.ascii_letters + string.digits, k=32))
@@ -146,6 +182,16 @@ EOF
 
 if [ $? -ne 0 ]; then
     echo -e "${R}ERROR: Failed to parse token${N}"
+    echo ""
+    echo -e "${Y}Alternative: Save JSON to file and use:${N}"
+    echo "  1. Di browser: Save page as session.json"
+    echo "  2. SCP: scp session.json user@server:~/chatgpt-web2api/"
+    echo "  3. Run: ./setup.sh session.json"
+    echo ""
+    echo -e "${Y}Atau gunakan nano:${N}"
+    echo "  nano /tmp/session.json"
+    echo "  (paste, Ctrl+O save, Ctrl+X exit)"
+    echo "  ./setup.sh /tmp/session.json"
     rm -f "$SESSION_TMP"
     exit 1
 fi
