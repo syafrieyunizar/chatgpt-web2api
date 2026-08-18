@@ -604,9 +604,18 @@ class ChatGPTProxyHandler(BaseHTTPRequestHandler):
             log(f"Requirements check skipped: {e}")
         
         # Main conversation request
+        # Convert OpenAI messages to ChatGPT backend format
+        chatgpt_messages = []
+        for msg in messages:
+            chatgpt_messages.append({
+                "id": str(uuid.uuid4()),
+                "author": {"role": msg["role"]},
+                "content": {"content_type": "text", "parts": [msg["content"]]},
+            })
+        
         conv_data = {
             "action": "next",
-            "messages": messages,
+            "messages": chatgpt_messages,
             "model": model,
             "timezone_offset_min": -420,
             "parent_message_id": str(uuid.uuid4()),

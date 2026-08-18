@@ -61,7 +61,7 @@ import sys, os, select
 chunks = []
 print('   Waiting for paste...', flush=True)
 while True:
-    ready, _, _ = select.select([sys.stdin], [], [], 3.0)
+    ready, _, _ = select.select([sys.stdin], [], [], 10.0)
     if ready:
         chunk = os.read(0, 65536)
         if not chunk:
