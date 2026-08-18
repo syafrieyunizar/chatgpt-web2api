@@ -474,7 +474,7 @@ class ChatGPTProxyHandler(BaseHTTPRequestHandler):
         return None
     def do_GET(self):
         if self.path == "/" or self.path == "/health":
-            self.send_json({"status": "ok", "version": __version__, "accounts": len(CONFIG["accounts"])})
+            self.send_json({"status": "ok", "version": __version__, "account": CONFIG.get("account", {}).get("name", "none")})
         elif self.path == "/v1/models":
             models_list = [{"id": k, "object": "model", "owned_by": "chatgpt", "desc": v["desc"]} for k, v in MODELS.items()]
             self.send_json({"object": "list", "data": models_list})

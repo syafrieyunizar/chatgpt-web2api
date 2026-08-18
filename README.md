@@ -19,8 +19,9 @@ Setup script akan arahkan Anda:
 
 1. Buka browser → `https://chatgpt.com/api/auth/session`
 2. Login ke ChatGPT (kalau belum)
-3. **Ctrl+A** → **Ctrl+C** (copy semua isi JSON)
-4. Paste ke terminal → **Ctrl+D**
+3. Halaman menampilkan JSON dengan `WARNING_BANNER` di atas — **abaikan banner**, yang penting ada `accessToken` + `sessionToken` di dalamnya
+4. **Ctrl+A** → **Ctrl+C** (copy semua isi JSON)
+5. Paste ke terminal → **Ctrl+D**
 
 ### Selesai! 🎉
 
