@@ -274,20 +274,27 @@ def load_accounts_from_config():
 
 
 def refresh_token_to_access(refresh_token: str) -> str:
-    url = "https://auth0.openai.com/oauth/token"
-    data = {
-        "redirect_uri": "com.openai.chat://auth0.openai.com/ios/com.openai.chat/callback",
-        "grant_type": "refresh_token",
-        "client_id": "pdlLIX2Y72MIl2rhLhTE9VV9bN905kB",
-        "refresh_token": refresh_token,
+    """Refresh access token using ChatGPT session endpoint.
+    
+    sessionToken from /api/auth/session is a NextAuth JWE token, NOT an OAuth refresh token.
+    To get a fresh accessToken: call /api/auth/session with sessionToken as cookie.
+    """
+    url = "https://chatgpt.com/api/auth/session"
+    cookies = {
+        "__Secure-next-auth.session-token": refresh_token,
     }
     try:
         session = cffi_requests.Session(impersonate=CONFIG.get("impersonate", "safari15_3"))
-        r = session.post(url, data=data, timeout=15)
+        r = session.get(url, cookies=cookies, timeout=15)
         r.raise_for_status()
-        token = r.json()["access_token"]
+        data = r.json()
+        token = data.get("accessToken")
+        if not token:
+            err = data.get("error", "No accessToken in response")
+            log(f"Token refresh failed: {err}")
+            raise RuntimeError(f"Refresh failed: {err}")
         session.close()
-        log("Access token refreshed OK")
+        log("Access token refreshed OK via session endpoint")
         return token
     except Exception as e:
         log(f"Token refresh failed: {e}")
