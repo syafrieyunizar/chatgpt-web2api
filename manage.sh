@@ -68,13 +68,21 @@ paste_and_parse() {
     local port="$2"
     
     echo ""
-    echo -e "${C}┌──────────────────────────────────────────┐${N}"
-    echo -e "${C}│  PASTE JSON HERE (lalu tekan Ctrl+D)     │${N}"
-    echo -e "${C}└──────────────────────────────────────────┘${N}"
+    echo -e "${C}┌──────────────────────────────────────────────┐${N}"
+    echo -e "${C}│  PASTE JSON HERE (paste, Enter, lalu Ctrl+D)  │${N}"
+    echo -e "${C}└──────────────────────────────────────────────┘${N}"
     echo ""
     
     local tmp="/tmp/chatgpt_session_$$"
-    cat > "$tmp"
+    
+    # Use Python to read stdin reliably (handles long paste without truncation)
+    python3 -c "
+import sys
+data = sys.stdin.read()
+with open('$tmp', 'w') as f:
+    f.write(data)
+print(f'Read {len(data)} bytes')
+"
     
     python3 << EOF
 import json, sys, os, string, random
@@ -87,6 +95,24 @@ script_dir = "$SCRIPT_DIR"
 
 with open(tmp, 'r') as f:
     raw = f.read().strip()
+
+# Parse JSON — handle long paste with possible whitespace
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    import re
+    first = raw.find('{')
+    last = raw.rfind('}')
+    if first != -1 and last != -1:
+        try:
+            data = json.loads(raw[first:last+1])
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Invalid JSON - {e}")
+            print(f"Input length: {len(raw)} chars")
+            sys.exit(1)
+    else:
+        print("ERROR: No JSON object found")
+        sys.exit(1)
 
 # Parse JSON (handle raw or embedded in HTML)
 try:
