@@ -528,7 +528,7 @@ class ChatGPTProxyHandler(BaseHTTPRequestHandler):
             return
         
         attempt = 0
-        max_attempts = 1  # Single account, no rotation
+        max_attempts = 3  # Allow retry after token refresh
         
         while attempt < max_attempts:
             access_token = get_access_token_for_account(account)
