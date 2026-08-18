@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
 config.json
+config-*.json
 cookie.txt
 .env
 .venv/
 __pycache__/
 *.log
+/tmp/chatgpt_session_*

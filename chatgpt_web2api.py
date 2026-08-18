@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-chatgpt-web2api - ChatGPT Web to OpenAI API proxy.
+chatgpt-web2api - ChatGPT Web to OpenAI API proxy with Multi-Account Support.
 
 Converts ChatGPT's web interface (chatgpt.com) into an OpenAI-compatible API
-server.  Direct reverse-engineered approach: POST to /backend-api/conversation,
-solve proof-of-work challenges, parse SSE streaming.
+server. Supports multiple accounts with automatic round-robin rotation.
 
 Usage:
-    pip install curl_cffi pybase64
+    pip install curl_cffi pybase64 Pillow
     python chatgpt_web2api.py [--port 6970] [--config config.json]
 
 Client configuration (Cherry Studio, ChatBox, etc.):
     Base URL: http://localhost:6970/v1
-    API Key:  your ChatGPT access token (or refresh token), or x-api-key
+    API Key:  sk-*** (generated or from config)
 
 How it works:
     1. GET chatgpt.com page → obtain cookies (oai-did, __cf_bm, etc.)
     2. POST /backend-api/sentinel/chat-requirements (solve PoW if needed)
-    3. POST /backend-api/conversation with SSE streaming
+    3. POST /backend-api/conversation with SSE streaming using rotating account
     4. Parse SSE chunks → OpenAI-compatible response (streaming or not)
+
+Multi-Account Feature:
+    - Load multiple accounts from config.json
+    - Round-robin rotation across requests
+    - Fallback to next account if one fails
+    - Each account has its own access_token + refresh_token
 """
 
 import json
@@ -41,6 +46,8 @@ try:
     HAS_CFFI = True
 except ImportError:
     HAS_CFFI = False
+    print("ERROR: curl_cffi not installed. Run: pip install curl_cffi")
+    sys.exit(1)
 
 try:
     import pybase64
@@ -56,7 +63,7 @@ except ImportError:
     HAS_PIL = False
     Image = None
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -70,8 +77,7 @@ DEFAULT_CONFIG = {
     "default_model": "gpt-4o-mini",
     "log_requests": True,
     "api_keys": [],
-    "access_token": None,
-    "refresh_token": None,
+    "account": None,  # Single account: {name, access_token, refresh_token}
     "proxy": None,
     "history_disabled": True,
     "pow_difficulty": "0fffff",
@@ -127,11 +133,15 @@ _cached_dpl_time = 0
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 
 
+# ─── Logging ─────────────────────────────────────────────────────────────────
+
 def log(msg: str):
     if CONFIG["log_requests"]:
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
 
+
+# ─── PoW Functions ───────────────────────────────────────────────────────────
 
 def _get_parse_time():
     now = datetime.now(timezone(timedelta(hours=-5)))
@@ -224,23 +234,43 @@ def _get_requirements_token(config):
 
 # ─── Token Management ────────────────────────────────────────────────────────
 
-# Cached access token. Re-populated on 401 via refresh_token (if configured).
-_cached_access_token = None
+
+class AccountManager:
+    """Manages single or multiple ChatGPT accounts."""
+    
+    def __init__(self, account=None):
+        self.account = account
+        self.current_index = 0 if account else -1
+        
+    def get_account(self):
+        """Get current account (single) or rotate."""
+        return self.account
+    
+    def rotate_on_error(self):
+        """No-op for single-account mode."""
+        pass
 
 
-class TokenExpiredError(RuntimeError):
-    """ChatGPT rejected the access token (HTTP 401). Triggers auto-refresh."""
+account_manager = None
 
-
-class RetryableError(RuntimeError):
-    """Transient upstream failure (429, 5xx, timeout) worth retrying.
-
-    status: HTTP status that caused it (0 = transport/network error).
-    """
-
-    def __init__(self, status: int, msg: str):
-        super().__init__(msg)
-        self.status = status
+def load_accounts_from_config():
+    """Load account(s) from config.json."""
+    global account_manager
+    account = CONFIG.get("account")
+    
+    # Fallback to legacy multi-account format
+    if not account:
+        accounts = CONFIG.get("accounts", [])
+        if accounts:
+            log("WARNING: Legacy 'accounts' array detected. Using first account only.")
+            account = accounts[0]
+            CONFIG["account"] = account
+    
+    if account:
+        account_manager = AccountManager(account)
+        log(f"Loaded account: {account.get('name', 'Default')}")
+    else:
+        log("WARNING: No account configured")
 
 
 def refresh_token_to_access(refresh_token: str) -> str:
@@ -264,84 +294,40 @@ def refresh_token_to_access(refresh_token: str) -> str:
         raise
 
 
-def get_access_token(force_refresh: bool = False):
-    """Return cached access token; refresh from refresh_token when asked.
-
-    Priority:
-      1. Cached token (unless force_refresh)
-      2. refresh_token in config (exchange → cache)
-      3. access_token in config (use as-is)
-    """
-    global _cached_access_token
-    if not force_refresh and _cached_access_token:
-        return _cached_access_token
-
-    at = CONFIG.get("access_token")
-    rt = CONFIG.get("refresh_token")
-
+def get_access_token_for_account(account: dict, force_refresh: bool = False) -> str:
+    """Get access token for a specific account."""
+    rt = account.get("refresh_token")
+    at = account.get("access_token")
+    
     if force_refresh and rt:
-        _cached_access_token = refresh_token_to_access(rt)
-        return _cached_access_token
+        return refresh_token_to_access(rt)
     if at:
-        _cached_access_token = at
-        return _cached_access_token
+        return at
     if rt:
-        _cached_access_token = refresh_token_to_access(rt)
-        return _cached_access_token
+        return refresh_token_to_access(rt)
     return None
+
+
+# ─── Error Classes ───────────────────────────────────────────────────────────
+
+class TokenExpiredError(RuntimeError):
+    """ChatGPT rejected the access token (HTTP 401). Triggers auto-refresh."""
+
+
+class RetryableError(RuntimeError):
+    """Transient upstream failure (429, 5xx, timeout) worth retrying.
+    
+    status: HTTP status that caused it (0 = transport/network error).
+    """
+    
+    def __init__(self, status: int, msg: str):
+        super().__init__(msg)
+        self.status = status
 
 
 def is_retryable_status(status: int) -> bool:
     """True if the upstream HTTP status is worth retrying."""
     return status == 429 or 500 <= status <= 599
-
-
-# ─── ChatGPT Backend ─────────────────────────────────────────────────────────
-
-def _make_session():
-    """Create a curl_cffi session with browser impersonation."""
-    imp = CONFIG.get("impersonate", "safari15_3")
-    proxy = CONFIG.get("proxy")
-    session = cffi_requests.Session(impersonate=imp, proxy=proxy)
-    return session
-
-
-def _base_headers(access_token):
-    h = {
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "content-type": "application/json",
-        "origin": "https://chatgpt.com",
-        "referer": "https://chatgpt.com/",
-        "user-agent": UA,
-    }
-    if access_token:
-        h["authorization"] = f"Bearer {access_token}"
-    return h
-
-
-def init_page_cookies(session):
-    """GET chatgpt.com/ to obtain essential cookies (oai-did, __cf_bm, etc)."""
-    r = session.get(CONFIG["host_url"] + "/", headers={"user-agent": UA}, timeout=10)
-    if r.status_code != 200:
-        log(f"Page load warning: status {r.status_code}")
-    # Also update DPL from page
-    global _cached_scripts, _cached_dpl, _cached_dpl_time
-    scripts = re.findall(r'<script[^>]+src="([^"]+)"', r.text)
-    if scripts:
-        _cached_scripts = scripts
-    for src in scripts:
-        m = re.search(r'/_next/static/([^/]+)/', src)
-        if m:
-            _cached_dpl = m.group(1)
-            break
-    if not _cached_dpl:
-        m = re.search(r'data-build="([^"]+)"', r.text)
-        if m:
-            _cached_dpl = m.group(1)
-    if _cached_dpl:
-        _cached_dpl_time = int(time.time())
-    return r.status_code
 
 
 # ─── File Upload ────────────────────────────────────────────────────────────
@@ -379,10 +365,10 @@ MIME_EXT_MAP = {
 
 
 def _mime_from_name(filename):
-    ext = os.path.splitext(filename or "")[1].lower()
+    ext = os.path.splitext(filename or "").lower()
     rev = {v: k for k, v in MIME_EXT_MAP.items() if v.startswith(ext)}
     if rev:
-        return max(rev)  # longest matching extension (e.g. .docx over .doc)
+        return max(rev)
     return "application/octet-stream"
 
 
@@ -403,881 +389,383 @@ def _parse_data_url(data_url):
     m = re.match(r"data:([^;,]+)?(;base64)?,(.*)", data_url, re.S)
     if not m:
         return None, None
-    mime, is_b64, payload = m.group(1), m.group(2), m.group(3)
-    if is_b64:
-        return pybase64.b64decode(payload), (mime or "application/octet-stream")
-    return payload.encode("utf-8"), (mime or "text/plain")
+    mime, is_base64, payload = m.groups()
+    if is_base64:
+        return pybase64.b64decode(payload), mime
+    return payload.encode(), mime
 
 
-def _fetch_file_content(source, session):
-    """source = data: URL or http(s) URL → (bytes, mime_type)."""
-    if isinstance(source, str) and source.startswith("data:"):
-        content, mime = _parse_data_url(source)
-        if content is None:
-            raise RuntimeError("invalid data: URL in image_url")
-        return content, mime
-    r = session.get(source, timeout=60)
+# ─── ChatGPT Backend ─────────────────────────────────────────────────────────
+
+def _make_session(account=None):
+    """Create a curl_cffi session with browser impersonation."""
+    imp = CONFIG.get("impersonate", "safari15_3")
+    proxy = CONFIG.get("proxy")
+    session = cffi_requests.Session(impersonate=imp, proxy=proxy)
+    return session
+
+
+def _base_headers(access_token):
+    h = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/json",
+        "origin": "https://chatgpt.com",
+        "referer": "https://chatgpt.com/",
+        "user-agent": UA,
+    }
+    if access_token:
+        h["authorization"] = f"Bearer {access_token}"
+    return h
+
+
+def init_page_cookies(session):
+    """GET chatgpt.com/ to obtain essential cookies (oai-did, __cf_bm, etc)."""
+    r = session.get(CONFIG["host_url"] + "/", headers={"user-agent": UA}, timeout=10)
     if r.status_code != 200:
-        raise RuntimeError(f"failed to fetch file URL {source[:80]}: HTTP {r.status_code}")
-    mime = r.headers.get("Content-Type", "").split(";")[0].strip() or "application/octet-stream"
-    return r.content, mime
-
-
-def _get_image_size(file_content):
-    if not HAS_PIL:
-        raise RuntimeError("Pillow (pillow) required for image uploads — pip install pillow")
-    with Image.open(io.BytesIO(file_content)) as img:
-        return img.width, img.height
-
-
-# ─── Local File Parsing (fallback when upload/read is unavailable) ──────────
-
-TEXT_EXTENSIONS = {
-    ".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".css", ".js",
-    ".py", ".sh", ".log", ".ini", ".yaml", ".yml", ".tex", ".rtf",
-}
-
-
-def _decode_bytes(file_content, mime_type):
-    for enc in ("utf-8", "latin-1", "cp1252"):
-        try:
-            return file_content.decode(enc)
-        except (UnicodeDecodeError, ValueError):
-            continue
-    return file_content.decode("utf-8", errors="replace")
-
-
-def _extract_pdf_text(file_content):
-    try:
-        from pypdf import PdfReader
-    except ImportError:
-        try:
-            from PyPDF2 import PdfReader
-        except ImportError:
-            return None, "PDF parsing needs pypdf: pip install pypdf"
-    try:
-        reader = PdfReader(io.BytesIO(file_content))
-        pages = []
-        for page in reader.pages:
-            t = page.extract_text() or ""
-            if t.strip():
-                pages.append(t.strip())
-    except Exception as e:
-        return None, f"PDF parse error: {e}"
-    if not pages:
-        return None, "PDF has no extractable text (scanned/image PDF not supported)"
-    return "\n\n".join(pages), None
-
-
-def _extract_docx_text(file_content):
-    try:
-        from docx import Document
-    except ImportError:
-        return None, "DOCX parsing needs python-docx: pip install python-docx"
-    try:
-        doc = Document(io.BytesIO(file_content))
-        parts = []
-        for p in doc.paragraphs:
-            if p.text.strip():
-                parts.append(p.text)
-        for tbl in doc.tables:
-            for row in tbl.rows:
-                cells = [c.text.strip() for c in row.cells]
-                if any(cells):
-                    parts.append(" | ".join(cells))
-    except Exception as e:
-        return None, f"DOCX parse error: {e}"
-    if not parts:
-        return None, "DOCX has no extractable text"
-    return "\n".join(parts), None
-
-
-def _extract_xlsx_text(file_content):
-    try:
-        import openpyxl
-    except ImportError:
-        return None, "XLSX parsing needs openpyxl: pip install openpyxl"
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(file_content), read_only=True, data_only=True)
-        parts = []
-        for ws in wb.worksheets:
-            rows = []
-            for row in ws.iter_rows(values_only=True):
-                cells = [str(c) if c is not None else "" for c in row]
-                if any(x.strip() for x in cells):
-                    rows.append("\t".join(cells))
-            if rows:
-                parts.append(f"[Sheet: {ws.title}]\n" + "\n".join(rows))
-    except Exception as e:
-        return None, f"XLSX parse error: {e}"
-    if not parts:
-        return None, "XLSX has no readable rows"
-    return "\n\n".join(parts), None
-
-
-def parse_file_text(file_content, mime_type, filename):
-    """Extract text from a file locally. Returns (text, error).
-
-    Images return (None, None) — they must go through the upload flow.
-    Unknown binaries return (None, "unsupported...").
-    """
-    if not file_content:
-        return None, "empty file"
-    mime = (mime_type or "").lower()
-    ext = os.path.splitext(filename or "")[1].lower()
-
-    if mime.startswith("image/"):
-        return None, None
-    if mime.startswith("text/") or ext in TEXT_EXTENSIONS:
-        return _decode_bytes(file_content, mime), None
-    if mime == "application/pdf" or ext == ".pdf":
-        return _extract_pdf_text(file_content)
-    if mime in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",) or ext == ".docx":
-        return _extract_docx_text(file_content)
-    if mime in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",) or ext == ".xlsx":
-        return _extract_xlsx_text(file_content)
-    if mime == "application/msword" or ext == ".doc":
-        return None, ".doc (old Word) not supported — convert to .docx or .pdf first"
-
-    # Unknown type: inline if it looks like readable text
-    try:
-        decoded = _decode_bytes(file_content, mime)
-        sample = decoded[:2000]
-        printable = sum(1 for ch in sample if ch.isprintable() or ch in "\n\t\r")
-        if sample and printable / len(sample) > 0.9:
-            return decoded, None
-    except Exception:
-        pass
-    return None, f"unsupported file type: {mime or ext or 'unknown'}"
-
-
-def _create_upload_url(session, access_token, file_name, file_size, use_case, oai_device_id):
-    url = CONFIG["host_url"] + "/backend-api/files"
-    headers = _base_headers(access_token)
-    headers["oai-device-id"] = oai_device_id
-    body = {
-        "file_name": file_name,
-        "file_size": file_size,
-        "reset_rate_limits": False,
-        "timezone_offset_min": -480,
-        "use_case": use_case,
-    }
-    r = session.post(url, headers=headers, json=body, timeout=15)
-    if r.status_code == 401:
-        raise TokenExpiredError("files: 401 unauthorized (token expired)")
-    if r.status_code != 200:
-        raise RuntimeError(f"files: HTTP {r.status_code} {r.text[:300]}")
-    res = r.json()
-    return res.get("file_id"), res.get("upload_url")
-
-
-def _upload_blob(session, upload_url, file_content, mime_type):
-    """Upload bytes to the presigned Azure Blob URL. No auth headers here."""
-    headers = {
-        "accept": "application/json, text/plain, */*",
-        "content-type": mime_type,
-        "x-ms-blob-type": "BlockBlob",
-        "x-ms-version": "2020-04-08",
-    }
-    r = session.put(upload_url, headers=headers, data=file_content, timeout=60)
-    if r.status_code != 201:
-        raise RuntimeError(f"blob upload: HTTP {r.status_code} {r.text[:300]}")
-
-
-def _register_upload(session, access_token, file_id):
-    """POST /files/{id}/uploaded — registers the blob upload so ChatGPT can find it."""
-    url = CONFIG["host_url"] + f"/backend-api/files/{file_id}/uploaded"
-    headers = _base_headers(access_token)
-    headers["oai-device-id"] = str(uuid.uuid4())
-    r = session.post(url, headers=headers, json={}, timeout=10)
-    if r.status_code == 401:
-        raise TokenExpiredError("files/uploaded: 401 unauthorized (token expired)")
-    if r.status_code != 200:
-        raise RuntimeError(f"files/uploaded: HTTP {r.status_code} {r.text[:300]}")
-    return r.json()
-
-
-def _confirm_upload(session, access_token, file_id):
-    """Poll /files/{id} until retrieval_index_status == success (non-image files)."""
-    url = CONFIG["host_url"] + f"/backend-api/files/{file_id}"
-    headers = _base_headers(access_token)
-    headers["oai-device-id"] = str(uuid.uuid4())
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        try:
-            r = session.get(url, headers=headers, timeout=10)
-        except Exception as e:
-            log(f"File status poll error: {e}")
-            time.sleep(1)
-            continue
-        if r.status_code == 200:
-            res = r.json()
-            status = res.get("retrieval_index_status", "")
-            if status == "success":
-                log(f"File {file_id} indexed")
-                return True
-            if status == "failed":
-                log(f"File {file_id} indexing FAILED")
-                return False
-        time.sleep(1)
-    return False
-
-
-def upload_file(session, access_token, file_content, mime_type, oai_device_id):
-    """Full upload flow → file_meta dict (or None). Mirrors the ChatGPT web client."""
-    if not file_content or not mime_type:
-        return None
-
-    width = height = None
-    if mime_type.startswith("image/"):
-        try:
-            width, height = _get_image_size(file_content)
-        except Exception as e:
-            log(f"Image size unavailable, falling back to text/plain: {e}")
-            mime_type = "text/plain"
-
-    file_size = len(file_content)
-    file_name = f"{uuid.uuid4()}{_get_file_extension(mime_type)}"
-    use_case = _determine_use_case(mime_type)
-
-    file_id, upload_url = _create_upload_url(session, access_token, file_name, file_size, use_case, oai_device_id)
-    if not file_id or not upload_url:
-        raise RuntimeError("no file_id/upload_url from /files")
-
-    _upload_blob(session, upload_url, file_content, mime_type)
-
-    # Register the upload so ChatGPT can find the file
-    _register_upload(session, access_token, file_id)
-
-    # Confirm indexing for retrievable files (skip ace_upload — raw uploads don't index)
-    if use_case != "ace_upload":
-        _confirm_upload(session, access_token, file_id)
-
-    return {
-        "file_id": file_id,
-        "file_name": file_name,
-        "size_bytes": file_size,
-        "mime_type": mime_type,
-        "width": width,
-        "height": height,
-        "use_case": use_case,
-    }
-
-
-def get_chat_requirements(session, access_token):
-    """POST /backend-api/sentinel/chat-requirements."""
-    url = CONFIG["host_url"] + "/backend-api/sentinel/chat-requirements"
-    headers = _base_headers(access_token)
-    headers["oai-device-id"] = str(uuid.uuid4())
-
-    config = _get_pow_config(UA)
-    p = _get_requirements_token(config)
-
-    r = session.post(url, headers=headers, json={"p": p}, timeout=15)
-    if r.status_code == 401:
-        raise TokenExpiredError("chat-requirements: 401 unauthorized (token expired)")
-    if is_retryable_status(r.status_code):
-        raise RetryableError(r.status_code, f"chat-requirements: HTTP {r.status_code}")
-    if r.status_code != 200:
-        raise RuntimeError(f"chat-requirements failed: {r.status_code} {r.text[:300]}")
-    return r.json(), config
-
-
-def _upload_attachment(session, access_token, file_content, mime_type, oai_device_id, display_name=None):
-    """Upload a file via the /files flow → attachments entry dict."""
-    file_meta = upload_file(session, access_token, file_content, mime_type, oai_device_id)
-    if not file_meta:
-        raise RuntimeError("file upload failed")
-    att = {
-        "id": file_meta["file_id"],
-        "size": file_meta["size_bytes"],
-        "name": display_name or file_meta["file_name"],
-        "mime_type": file_meta["mime_type"],
-    }
-    if file_meta.get("width") is not None:
-        att["width"] = file_meta["width"]
-        att["height"] = file_meta["height"]
-    return att
-
-
-def open_conversation(session, access_token, chat_token, proof_token, messages, model_slug, oai_device_id):
-    """POST /backend-api/conversation (stream=True). Returns the response object.
-
-    Raises TokenExpiredError on 401, RetryableError on 429/5xx, RuntimeError otherwise.
-    The response body is NOT consumed here — caller iterates resp.iter_lines().
-    Splitting open vs read lets us retry/refresh before any SSE bytes go to the client.
-    """
-    url = CONFIG["host_url"] + "/backend-api/conversation"
-    headers = _base_headers(access_token)
-    headers["accept"] = "text/event-stream"
-    headers["oai-device-id"] = oai_device_id
-    if chat_token:
-        headers["openai-sentinel-chat-requirements-token"] = chat_token
-    if proof_token:
-        headers["openai-sentinel-proof-token"] = proof_token
-
-    chat_messages = []
-    file_mode = CONFIG.get("file_mode", "parse")
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            parts = []
-            attachments = []
-            for c in content:
-                ctype = c.get("type")
-                if ctype in ("text", "input_text"):
-                    parts.append(c.get("text", ""))
-                elif ctype == "image_url":
-                    img_url = c.get("image_url", {}).get("url")
-                    if not img_url:
-                        continue
-                    file_content, mime_type = _fetch_file_content(img_url, session)
-                    if file_mode == "parse" and not (mime_type or "").startswith("image/"):
-                        text, err = parse_file_text(file_content, mime_type, "")
-                        if text is not None:
-                            parts.append(f"[File attachment]\n{text.strip()}")
-                            log("Inlined non-image attachment via image_url (parse mode)")
-                            continue
-                        if err:
-                            log(f"Parse failed for image_url content: {err}")
-                    # image (or upload mode): real multimodal upload
-                    if (mime_type or "").startswith("image/"):
-                        file_meta = upload_file(session, access_token, file_content, mime_type, oai_device_id)
-                        if not file_meta:
-                            raise RuntimeError("image upload failed")
-                        fid = file_meta["file_id"]
-                        parts.append({
-                            "content_type": "image_asset_pointer",
-                            "asset_pointer": f"file-service://{fid}",
-                            "size_bytes": file_meta["size_bytes"],
-                            "width": file_meta.get("width"),
-                            "height": file_meta.get("height"),
-                        })
-                        att = {
-                            "id": fid,
-                            "size": file_meta["size_bytes"],
-                            "name": file_meta["file_name"],
-                            "mime_type": file_meta["mime_type"],
-                        }
-                        if file_meta.get("width") is not None:
-                            att["width"] = file_meta["width"]
-                            att["height"] = file_meta["height"]
-                        attachments.append(att)
-                    else:
-                        # non-image in upload mode
-                        attachments.append(_upload_attachment(
-                            session, access_token, file_content, mime_type, oai_device_id))
-                elif ctype in ("file", "input_file"):
-                    # {type: file, file: {file_data|file_url, filename}}
-                    finfo = c.get("file") or {}
-                    source = finfo.get("file_data") or finfo.get("file_url") or finfo.get("url")
-                    if not source:
-                        continue
-                    fname = finfo.get("filename") or ""
-                    file_content, mime_type = _fetch_file_content(source, session)
-                    if file_mode == "parse" and not (mime_type or "").startswith("image/"):
-                        text, err = parse_file_text(file_content, mime_type, fname)
-                        if text is not None:
-                            label = fname or "attachment"
-                            parts.append(f"[File: {label}]\n{text.strip()}")
-                            log(f"Inlined file {label} ({len(file_content)} bytes) as text")
-                            continue
-                        if err:
-                            log(f"Parse failed for {fname}: {err}")
-                    # upload mode / image / unparseable → real upload
-                    attachments.append(_upload_attachment(
-                        session, access_token, file_content, mime_type, oai_device_id, fname))
-            content_type = "multimodal_text" if len(attachments) else "text"
-            if not parts:
-                parts = [""]
-            chat_messages.append({
-                "id": str(uuid.uuid4()),
-                "author": {"role": role},
-                "content": {"content_type": content_type, "parts": parts},
-                "metadata": {"attachments": attachments} if attachments else {},
-            })
-        else:
-            chat_messages.append({
-                "id": str(uuid.uuid4()),
-                "author": {"role": role},
-                "content": {"content_type": "text", "parts": [content]},
-                "metadata": {},
-            })
-
-    body = {
-        "action": "next",
-        "client_contextual_info": {
-            "is_dark_mode": False,
-            "time_since_loaded": random.randint(50, 500),
-            "page_height": random.randint(500, 1000),
-            "page_width": random.randint(1000, 2000),
-            "pixel_ratio": 1.5,
-            "screen_height": random.randint(800, 1200),
-            "screen_width": random.randint(1200, 2200),
-        },
-        "conversation_mode": {"kind": "primary_assistant"},
-        "conversation_origin": None,
-        "force_paragen": False,
-        "force_paragen_model_slug": "",
-        "force_rate_limit": False,
-        "force_use_sse": True,
-        "history_and_training_disabled": CONFIG.get("history_disabled", True),
-        "messages": chat_messages,
-        "model": model_slug,
-        "paragen_cot_summary_display_override": "allow",
-        "paragen_stream_type_override": None,
-        "parent_message_id": str(uuid.uuid4()),
-        "reset_rate_limits": False,
-        "suggestions": [],
-        "supported_encodings": [],
-        "system_hints": [],
-        "timezone": "America/Los_Angeles",
-        "timezone_offset_min": -480,
-        "variant_purpose": "comparison_implicit",
-        "websocket_request_id": str(uuid.uuid4()),
-    }
-
-    resp = session.post(url, headers=headers, json=body, timeout=CONFIG["request_timeout_sec"], stream=True)
-    if resp.status_code == 401:
-        resp.close()
-        raise TokenExpiredError("conversation: 401 unauthorized (token expired)")
-    if is_retryable_status(resp.status_code):
-        resp.close()
-        raise RetryableError(resp.status_code, f"conversation: HTTP {resp.status_code}")
-    if resp.status_code != 200:
-        error_body = resp.text[:500] if hasattr(resp, 'text') else "unknown"
-        resp.close()
-        raise RuntimeError(f"conversation failed: {resp.status_code} {error_body}")
-    return resp
-
-
-def run_conversation(session, access_token, chat_token, proof_token, messages, model_slug, oai_device_id, retry_attempts=None, retry_delay=None):
-    """Open the conversation with retry-on-transient errors.
-
-    Returns a response whose iter_lines() yields the SSE stream. Caller consumes it.
-    TokenExpiredError (401) is intentionally NOT handled here — it propagates so the
-    caller can refresh the access token and redo the whole pipeline (fresh chat token too).
-    """
-    attempts = retry_attempts if retry_attempts is not None else CONFIG.get("retry_attempts", 3)
-    delay = retry_delay if retry_delay is not None else CONFIG.get("retry_delay_sec", 2)
-
-    last_err = None
-    for attempt in range(attempts):
-        try:
-            return open_conversation(session, access_token, chat_token, proof_token, messages, model_slug, oai_device_id)
-        except RetryableError as e:
-            last_err = e
-            if attempt < attempts - 1:
-                log(f"Transient error (HTTP {e.status}), retry {attempt + 1}/{attempts}")
-                time.sleep(delay)
-                continue
-            raise
-        except Exception as e:
-            if isinstance(e, TokenExpiredError):
-                raise  # let the caller handle 401/refresh
-            last_err = e
-            # Retry transport-level errors (network drop, timeout) too.
-            if attempt < attempts - 1:
-                log(f"Transport error, retry {attempt + 1}/{attempts}: {e}")
-                time.sleep(delay)
-                continue
-            raise
-
-    raise last_err if last_err else RuntimeError("conversation failed")
-
-
-# ─── SSE Parsing ─────────────────────────────────────────────────────────────
-
-def _decode_line(line):
-    if isinstance(line, bytes):
-        return line.decode("utf-8", errors="replace")
-    return line or ""
-
-
-def parse_sse_stream(response_lines, model_name):
-    """Parse ChatGPT SSE → OpenAI-format chunks. Yields SSE strings."""
-    chat_id = f"chatcmpl-{''.join(random.choice(string.ascii_letters + string.digits) for _ in range(29))}"
-    created = int(time.time())
-
-    # First chunk: role
-    yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'logprobs': None, 'finish_reason': None}]})}\n\n"
-
-    prev_text = ""
-    end = False
-
-    for raw in response_lines:
-        if end:
+        log(f"Page load warning: status {r.status_code}")
+    global _cached_scripts, _cached_dpl, _cached_dpl_time
+    scripts = re.findall(r'<script[^>]+src="([^"]+)"', r.text)
+    if scripts:
+        _cached_scripts = scripts
+    for src in scripts:
+        m = re.search(r'/_next/static/([^/]+)/', src)
+        if m:
+            _cached_dpl = m.group(1)
             break
-        line = _decode_line(raw)
-        if not line.startswith("data: "):
-            continue
-        data_str = line[6:]
-        if data_str == "[DONE]":
-            break
-        try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-
-        message = data.get("message", {})
-        if not message:
-            if data.get("error"):
-                yield f"data: {json.dumps({'error': data['error']})}\n\n"
-                break
-            continue
-
-        role = message.get("author", {}).get("role")
-        if role in ("user", "system"):
-            continue
-
-        status = message.get("status")
-        content = message.get("content", {})
-
-        if status == "in_progress":
-            ct = content.get("content_type")
-            if ct == "text":
-                parts = content.get("parts", [])
-                if parts:
-                    part = parts[0]
-                    if isinstance(part, str) and len(part) > len(prev_text):
-                        delta = part[len(prev_text):]
-                        prev_text = part
-                        yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': delta}, 'logprobs': None, 'finish_reason': None}]})}\n\n"
-
-        elif status == "finished_successfully":
-            if content.get("content_type") == "text":
-                parts = content.get("parts", [])
-                if parts and isinstance(parts[0], str):
-                    final_part = parts[0]
-                    delta = final_part[len(prev_text):] if len(final_part) > len(prev_text) else ""
-                    if delta:
-                        yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': delta}, 'logprobs': None, 'finish_reason': None}]})}\n\n"
-            # Final chunk
-            yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'logprobs': None, 'finish_reason': 'stop'}]})}\n\n"
-            end = True
-
-    if not end:
-        yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'logprobs': None, 'finish_reason': 'stop'}]})}\n\n"
-
-    yield "data: [DONE]\n\n"
+    if not _cached_dpl:
+        m = re.search(r'data-build="([^"]+)"', r.text)
+        if m:
+            _cached_dpl = m.group(1)
+    if _cached_dpl:
+        _cached_dpl_time = int(time.time())
+    return r.status_code
 
 
-def collect_full_text(response_lines):
-    """Parse SSE stream → (full_text, model_slug)."""
-    full_text = ""
-    for raw in response_lines:
-        line = _decode_line(raw)
-        if not line.startswith("data: "):
-            continue
-        data_str = line[6:]
-        if data_str == "[DONE]":
-            break
-        try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-        message = data.get("message", {})
-        if not message:
-            continue
-        role = message.get("author", {}).get("role")
-        if role in ("user", "system"):
-            continue
-        status = message.get("status")
-        content = message.get("content", {})
-        if status == "finished_successfully" and content.get("content_type") == "text":
-            parts = content.get("parts", [])
-            if parts and isinstance(parts[0], str):
-                full_text = parts[0]
-                break
-        elif status == "in_progress" and content.get("content_type") == "text":
-            parts = content.get("parts", [])
-            if parts and isinstance(parts[0], str):
-                full_text = parts[0]
-    return full_text
+# ─── HTTP Server ─────────────────────────────────────────────────────────────
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 
-# ─── HTTP Handler ────────────────────────────────────────────────────────────
-
-class ChatGPTHandler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        client_ip = self.client_address[0] if self.client_address else "-"
-        log(f"{client_ip} {fmt % args}")
-
+class ChatGPTProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    
+    def log_message(self, format, *args):
+        pass  # Suppress default logging
+    
     def send_json(self, data, status=200):
-        body = json.dumps(data, ensure_ascii=False).encode()
+        body = json.dumps(data, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-
-    def _authorized(self):
-        keys = CONFIG.get("api_keys") or []
-        if not keys:
-            return True
+    
+    def check_api_key(self) -> str | None:
         auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:] in keys:
-            return True
-        if self.headers.get("x-api-key", "") in keys:
-            return True
-        return False
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.end_headers()
-
+        if auth.startswith("Bearer "):
+            key = auth[7:]
+            if key in CONFIG["api_keys"]:
+                return key
+        api_key = self.headers.get("X-API-Key", "")
+        if api_key in CONFIG["api_keys"]:
+            return api_key
+        return None
     def do_GET(self):
-        try:
-            if self.path.startswith("/v1") and not self._authorized():
-                self.send_json({"error": {"message": "invalid api key"}}, 401)
-                return
-            if self.path == "/v1/models":
-                self.send_json({"object": "list", "data": [
-                    {"id": n, "object": "model", "created": 1700000000,
-                     "owned_by": "openai", "description": c["desc"]}
-                    for n, c in MODELS.items()
-                ]})
-            elif self.path == "/" or self.path == "/health":
-                self.send_json({"status": "ok", "version": __version__,
-                                "models": list(MODELS.keys()),
-                                "token_configured": bool(CONFIG.get("access_token") or CONFIG.get("refresh_token"))})
-            else:
-                self.send_json({"error": "not found"}, 404)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception as e:
-            log(f"GET error: {e}")
-
+        if self.path == "/" or self.path == "/health":
+            self.send_json({"status": "ok", "version": __version__, "accounts": len(CONFIG["accounts"])})
+        elif self.path == "/v1/models":
+            models_list = [{"id": k, "object": "model", "owned_by": "chatgpt", "desc": v["desc"]} for k, v in MODELS.items()]
+            self.send_json({"object": "list", "data": models_list})
+        elif self.path.startswith("/v1/") and self.path.endswith("/models"):
+            self.send_json({"object": "list", "data": [{"id": k, "object": "model", "owned_by": "chatgpt"} for k in MODELS.keys()]})
+        else:
+            self.send_json({"error": "Not found"}, 404)
+    
     def do_POST(self):
-        try:
-            if self.path.startswith("/v1") and not self._authorized():
-                self.send_json({"error": {"message": "invalid api key"}}, 401)
-                return
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length) if length else b""
-            if self.path == "/v1/chat/completions":
-                self.handle_chat(body)
-            else:
-                self.send_json({"error": "not found"}, 404)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception as e:
-            log(f"POST error: {e}")
-            try:
-                self.send_json({"error": {"message": str(e)}}, 500)
-            except:
-                pass
-
-    def handle_chat(self, body: bytes):
-        req = json.loads(body)
-        model_name = req.get("model", CONFIG["default_model"])
-        model_cfg = MODELS.get(model_name)
-        if not model_cfg:
-            for k, v in MODELS.items():
-                if k.startswith(model_name) or model_name.startswith(k):
-                    model_name, model_cfg = k, v
-                    break
-        if not model_cfg:
-            self.send_json({"error": {"message": f"Unknown model: {model_name}"}}, 400)
+        if self.path == "/v1/chat/completions":
+            self.handle_chat_completions()
+        else:
+            self.send_json({"error": "Not found"}, 404)
+    
+    def handle_chat_completions(self):
+        """Handle /v1/chat/completions with single account."""
+        auth_key = self.check_api_key()
+        if not auth_key:
+            self.send_json({"error": "Missing or invalid API key"}, 401)
             return
-        model_slug = model_cfg["slug"]
-
-        messages = req.get("messages", [])
+        
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        
+        try:
+            request = json.loads(body.decode())
+        except json.JSONDecodeError:
+            self.send_json({"error": "Invalid JSON"}, 400)
+            return
+        
+        messages = request.get("messages", [])
+        model = request.get("model", CONFIG["default_model"])
+        stream = request.get("stream", False)
+        
         if not messages:
-            self.send_json({"error": {"message": "empty messages"}}, 400)
+            self.send_json({"error": "No messages provided"}, 400)
             return
-
-        stream = req.get("stream", False)
-        log(f"Chat: model={model_name} slug={model_slug} stream={stream} msgs={len(messages)}")
-
-        # Get access token
-        try:
-            access_token = get_access_token()
-        except Exception as e:
-            self.send_json({"error": {"message": f"auth error: {e}"}}, 401)
+        
+        # Get account (single account mode)
+        account = account_manager.get_account() if account_manager else None
+        
+        if not account:
+            self.send_json({"error": "No account configured"}, 503)
             return
-        if not access_token:
-            self.send_json({"error": {"message": "No access_token or refresh_token configured"}}, 401)
-            return
-
-        # Create session with browser impersonation
-        session = _make_session()
-
-        try:
-            # Retry loop covers the whole pipeline: 401 → auto-refresh token & redo;
-            # transient errors (429/5xx) → backoff & redo.
-            attempts = CONFIG.get("retry_attempts", 3)
-            delay = CONFIG.get("retry_delay_sec", 2)
-            last_err = None
-            resp = None
-            oai_device_id = str(uuid.uuid4())
-            for attempt in range(attempts):
-                try:
-                    # Step 1: Load page for cookies
-                    init_page_cookies(session)
-
-                    # Step 2: Get chat requirements
-                    req_data, pow_config = get_chat_requirements(session, access_token)
-                    chat_token = req_data.get("token")
-                    if not chat_token:
-                        raise RuntimeError(f"No chat token: {str(req_data)[:300]}")
-
-                    # Step 3: Solve PoW
-                    proof_token = None
-                    pow_data = req_data.get("proofofwork", {})
-                    if pow_data.get("required"):
-                        pow_seed = pow_data.get("seed", "")
-                        pow_diff = pow_data.get("difficulty", CONFIG["pow_difficulty"])
-                        log(f"PoW: seed={pow_seed[:20]}... diff={pow_diff}")
-                        proof_token, solved = _get_answer_token(pow_seed, pow_diff, pow_config)
-                        log(f"PoW solved: {solved}")
-                    else:
-                        log("PoW not required")
-
-                    # Step 4: Send conversation (retry + 401-refresh inside)
-                    resp = run_conversation(
-                        session, access_token, chat_token, proof_token,
-                        messages, model_slug, oai_device_id,
-                        retry_attempts=1, retry_delay=delay,
-                    )
-                    break
-                except TokenExpiredError as e:
-                    # 401 anywhere in the pipeline → refresh token once, redo everything.
-                    if CONFIG.get("refresh_token"):
-                        log("401 → refreshing access token via refresh_token")
-                        try:
-                            access_token = get_access_token(force_refresh=True)
-                        except Exception as re:
-                            raise RuntimeError(f"token refresh failed: {re}") from e
-                        log("Token refreshed, restarting pipeline")
-                        continue  # redo from step 1 with new token
-                    self.send_json({
-                        "error": {"message": "access token expired and no refresh_token configured — update config.json"},
-                        "hint": "Get a fresh accessToken from https://chatgpt.com/api/auth/session, or set refresh_token",
-                    }, 401)
-                    return
-                except RetryableError as e:
-                    last_err = e
-                    if attempt < attempts - 1:
-                        log(f"Transient error (HTTP {e.status}), retry {attempt + 1}/{attempts}")
-                        time.sleep(delay)
-                        continue
-                    raise
-                except Exception as e:
-                    last_err = e
-                    if attempt < attempts - 1:
-                        log(f"Pipeline error, retry {attempt + 1}/{attempts}: {e}")
-                        time.sleep(delay)
-                        continue
-                    raise
-
-            if resp is None:
-                raise last_err if last_err else RuntimeError("pipeline failed")
-
-            sse_lines = resp.iter_lines()
-
-            if stream:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                for chunk in parse_sse_stream(sse_lines, model_name):
-                    self.wfile.write(chunk.encode())
-                    self.wfile.flush()
-            else:
-                full_text = collect_full_text(sse_lines)
-                chat_id = f"chatcmpl-{''.join(random.choice(string.ascii_letters + string.digits) for _ in range(29))}"
-                if not full_text.strip():
-                    self.send_json({"error": {"message": "Empty response from ChatGPT"}}, 502)
-                    return
-                self.send_json({
-                    "id": chat_id,
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": full_text},
-                        "logprobs": None,
-                        "finish_reason": "stop",
-                    }],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": len(full_text) // 4, "total_tokens": len(full_text) // 4},
-                })
-
-        except Exception as e:
-            log(f"Conversation error: {e}")
+        
+        attempt = 0
+        max_attempts = 1  # Single account, no rotation
+        
+        while attempt < max_attempts:
+            access_token = get_access_token_for_account(account)
+            if not access_token:
+                self.send_json({"error": "No access token available"}, 503)
+                return
+            
+            # Make request
             try:
-                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            except:
-                pass
-        finally:
-            session.close()
+                session = _make_session(account)
+                init_page_cookies(session)
+                
+                conversation_response = self._send_conversation_request(session, messages, model, access_token, stream)
+                
+                session.close()
+                return conversation_response
+                
+            except TokenExpiredError:
+                log(f"Account {account['name']}: Token expired, refreshing...")
+                try:
+                    new_token = refresh_token_to_access(account["refresh_token"])
+                    account["access_token"] = new_token
+                    account_manager.rotate_on_error()
+                    attempt += 1
+                    continue
+                except Exception as e:
+                    log(f"Account {account['name']}: Refresh failed: {e}")
+                    if account_manager:
+                        account_manager.rotate_on_error()
+                        attempt += 1
+                        continue
+                    else:
+                        self.send_json({"error": "Token refresh failed"}, 503)
+                        return
+                        
+            except RetryableError as e:
+                log(f"Retryable error: {e} ({e.status}), trying again...")
+                if account_manager:
+                    account_manager.rotate_on_error()
+                    attempt += 1
+                    continue
+                else:
+                    raise
+                    
+            except Exception as e:
+                log(f"Error: {e}")
+                if account_manager:
+                    account_manager.rotate_on_error()
+                    attempt += 1
+                    continue
+                else:
+                    self.send_json({"error": str(e)}, 500)
+                    return
+        
+        self.send_json({"error": "All accounts failed"}, 503)
+    
+    def _send_conversation_request(self, session, messages, model, access_token, stream):
+        """Send chat request to ChatGPT backend."""
+        headers = _base_headers(access_token)
+        
+        # Try requirements endpoint first
+        try:
+            req_data = _get_requirements_token(_get_pow_config())
+            r_req = session.post(CONFIG["host_url"] + "/backend-api/sentinel/chat-requirements",
+                               json=req_data, headers=headers, timeout=30)
+            if r_req.status_code == 200:
+                log("Requirements check passed")
+            elif r_req.status_code == 429:
+                raise RetryableError(429, "Rate limited by ChatGPT")
+            else:
+                log(f"Requirements check: status {r_req.status_code}")
+        except Exception as e:
+            log(f"Requirements check skipped: {e}")
+        
+        # Main conversation request
+        conv_data = {
+            "action": "next",
+            "messages": messages,
+            "model": model,
+            "timezone_offset_min": -420,
+            "parent_message_id": str(uuid.uuid4()),
+            "system_generated_messages_count": 0,
+            "is_visually_text_search_enabled": False,
+            "history_and_training_disabled": CONFIG.get("history_disabled", True),
+        }
+        
+        resp = session.post(CONFIG["host_url"] + "/backend-api/conversation",
+                          json=conv_data, headers=headers, timeout=CONFIG.get("request_timeout_sec", 120))
+        
+        if resp.status_code == 401:
+            raise TokenExpiredError("Access token rejected")
+        
+        if resp.status_code >= 500:
+            raise RetryableError(resp.status_code, f"Server error: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            self.send_json({"error": f"Backend error: {resp.status_code}", "details": resp.text[:500]}, resp.status_code)
+            return
+        
+        if stream:
+            return self._stream_response(resp)
+        else:
+            return self._parse_non_stream_response(resp)
+    
+    def _stream_response(self, resp):
+        """Parse SSE stream and return OpenAI-style streaming response."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        
+        buffer = b""
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if not line.startswith("data: "):
+                continue
+            try:
+                data = json.loads(line[6:])
+                if "token" in data:
+                    delta = {"role": "assistant", "content": data["token"]}
+                    chunk = json.dumps({"id": str(uuid.uuid4()), "object": "chat.completion.chunk",
+                                      "created": int(time.time()), "model": "gpt-4o-mini",
+                                      "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+                                     separators=(",", ":"))
+                    self.wfile.write(f"data: {chunk}\n\n".encode())
+            except json.JSONDecodeError:
+                continue
+        
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+    
+    def _parse_non_stream_response(self, resp):
+        """Parse non-stream response and return OpenAI-style JSON."""
+        text = resp.text.strip()
+        
+        # Parse SSE-like structure
+        lines = text.split("\n")
+        content = ""
+        finish_reason = None
+        
+        for line in lines:
+            if line.startswith("data: "):
+                try:
+                    data = json.loads(line[6:])
+                    if "token" in data:
+                        content += data["token"]
+                    if "message" in data and data["message"].get("author"):
+                        finish_reason = data["message"].get("end_turn")
+                except json.JSONDecodeError:
+                    continue
+        
+        response = {
+            "id": str(uuid.uuid4()),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": CONFIG["default_model"],
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish_reason or "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": len(content.split()) if content else 0,
+                "total_tokens": 0
+            }
+        }
+        self.send_json(response)
 
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+def load_config(config_path):
+    """Load config from JSON file (single account mode)."""
+    global CONFIG
+    if not os.path.exists(config_path):
+        log(f"Config file not found: {config_path}")
+        sys.exit(1)
+    
+    with open(config_path, "r") as f:
+        loaded = json.load(f)
+    
+    # Merge with defaults
+    CONFIG.update(loaded)
+    
+    # Support 'api_key' field for single key or 'api_keys' array
+    api_key = loaded.get("api_key")
+    if api_key:
+        CONFIG["api_keys"] = [api_key]
+    elif not CONFIG.get("api_keys"):
+        CONFIG["api_keys"] = [generate_random_api_key()]
+        log(f"Generated API key: {CONFIG['api_keys'][0]}")
+    
+    # Check for legacy fields and convert to single account format
+    if CONFIG.get("access_token") or CONFIG.get("refresh_token"):
+        log("WARNING: Legacy access_token/refresh_token fields detected. Converting to single account.")
+        CONFIG.setdefault("account", {})["name"] = "Legacy"
+        if CONFIG.get("access_token"):
+            CONFIG["account"]["access_token"] = CONFIG.get("access_token")
+        if CONFIG.get("refresh_token"):
+            CONFIG["account"]["refresh_token"] = CONFIG.get("refresh_token")
+    
+    # Convert multi-account array to first account only
+    accounts = CONFIG.get("accounts", [])
+    if len(accounts) > 0:
+        log(f"INFO: Found {len(accounts)} accounts. Using first one only (single-account mode).")
+        CONFIG["account"] = accounts[0]
+    
+    log(f"Configuration loaded:")
+    log(f"  - Port: {CONFIG['port']}")
+    log(f"  - Host: {CONFIG['host']}")
+    log(f"  - Account: {'configured' if CONFIG.get('account') else 'none'}")
+    log(f"  - API Key: {CONFIG['api_keys'][0][:20]}...")
+    
+    # Load account for this server instance
+    load_accounts_from_config()
 
-def load_config(path):
-    if path and os.path.exists(path):
-        with open(path) as f:
-            CONFIG.update(json.load(f))
-        log(f"Config loaded: {path}")
+
+def generate_random_api_key():
+    """Generate random API key."""
+    return f"sk-{''.join(random.choices(string.ascii_letters + string.digits, k=32))}"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ChatGPT Web to OpenAI API")
-    parser.add_argument("--port", type=int, default=None)
-    parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--access-token", type=str, default=None)
-    parser.add_argument("--refresh-token", type=str, default=None)
-    parser.add_argument("--proxy", type=str, default=None)
-    parser.add_argument("--version", action="version", version=f"chatgpt-web2api {__version__}")
+    parser = argparse.ArgumentParser(description="ChatGPT Web to API Proxy")
+    parser.add_argument("--port", type=int, default=6970, help="Port to listen on")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--config", default="config.json", help="Config file path")
     args = parser.parse_args()
-
-    config_path = args.config or os.environ.get("CHATGPT_WEB2API_CONFIG")
-    if not config_path:
-        for p in ["./config.json", os.path.expanduser("~/.config/chatgpt-web2api/config.json")]:
-            if os.path.exists(p):
-                config_path = p
-                break
-    load_config(config_path)
-
-    if args.port:
-        CONFIG["port"] = args.port
-    if args.access_token:
-        CONFIG["access_token"] = args.access_token
-    if args.refresh_token:
-        CONFIG["refresh_token"] = args.refresh_token
-    if args.proxy:
-        CONFIG["proxy"] = args.proxy
-
-    if not HAS_CFFI:
-        print("Error: curl_cffi is required. Install with: pip install curl_cffi")
-        sys.exit(1)
-
-    class ThreadedServer(ThreadingMixIn, HTTPServer):
-        daemon_threads = True
-        allow_reuse_address = True
-
-    port = CONFIG["port"]
-    server = ThreadedServer((CONFIG["host"], port), ChatGPTHandler)
-    print(f"chatgpt-web2api v{__version__}")
-    print(f"  Listening: http://0.0.0.0:{port}")
-    print(f"  Base URL:  http://localhost:{port}/v1")
-    print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Token:     {'yes' if CONFIG.get('access_token') or CONFIG.get('refresh_token') else 'none'}")
-    print(f"  Proxy:     {CONFIG.get('proxy') or 'none'}")
-    print(f"  Impersonate: {CONFIG.get('impersonate', 'safari15_3')}")
-    print()
+    
+    port = args.port if args.port else CONFIG["port"]
+    host = args.host if args.host else CONFIG["host"]
+    
+    load_config(args.config)
+    
+    server = ThreadedHTTPServer((host, port), ChatGPTProxyHandler)
+    log(f"Starting ChatGPT Web2API server on {host}:{port}")
+    log(f"API Key: {CONFIG['api_keys'][0][:20]}...")
+    log(f"Account: {'configured' if CONFIG.get('account') else 'none'} ({'static' if account_manager else 'none'})")
+    
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopped.")
+        log("Shutting down...")
         server.shutdown()
 
 
