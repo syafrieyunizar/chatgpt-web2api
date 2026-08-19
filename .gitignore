@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+*.swp
+*.swo
 config.json
 config-*.json
 cookie.txt

@@ -1,189 +1,251 @@
 # ChatGPT Web2API
 
-Scrape ChatGPT web (chatgpt.com) dan jadikan OpenAI-compatible API server di localhost.
+Scrape ChatGPT web (chatgpt.com) dan jadikan **OpenAI-compatible API server** di localhost.
 
-## Quick Start (2 Langkah)
+Konsep: **1 akun ChatGPT = 1 local port**. Mau pakai banyak akun? Jalankan banyak instance, masing-masing dengan config dan port sendiri.
 
-### Langkah 1: Install & Run Setup
+## Fitur
 
-```bash
-git clone https://github.com/syafrieyunizar/chatgpt-web2api.git
-cd chatgpt-web2api
-chmod +x setup.sh
-./setup.sh
-```
+- Endpoint OpenAI-compatible: `POST /v1/chat/completions`, `GET /v1/models`
+- Streaming (SSE) & non-streaming
+- Bypass anti-bot: browser impersonation (`curl_cffi`), proof-of-work solver, sentinel token
+- File attachment: TXT/PDF/DOCX/XLSX di-parse lokal jadi teks, gambar di-upload
+- Multi-instance: 1 akun 1 port, jalan berdampingan
 
-### Langkah 2: Paste Token
+## Requirements
 
-Setup script akan arahkan Anda:
-
-1. Buka browser → `https://chatgpt.com/api/auth/session`
-2. Login ke ChatGPT (kalau belum)
-3. Halaman menampilkan JSON dengan `WARNING_BANNER` di atas — **abaikan banner**, yang penting ada `accessToken` + `sessionToken` di dalamnya
-4. **Ctrl+A** → **Ctrl+C** (copy semua isi JSON)
-5. Paste ke terminal → **Ctrl+D**
-
-### Selesai! 🎉
-
-Server jalan di `http://localhost:6970`
-
-```
-Server:   http://localhost:6970
-API Key:  sk-xxxx (auto-generated, cek config.json)
-```
-
-## Test API
+- Python 3.9+
+- Akun ChatGPT (free/plus)
 
 ```bash
-curl -X POST http://localhost:6970/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}]}'
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
-## Client Config (Cherry Studio, ChatBox, dll)
+## Cara Ambil Token
 
-| Field | Value |
-|---|---|
-| Base URL | `http://localhost:6970/v1` |
-| API Key | Cek `config.json` field `api_key` |
+1. Login ke https://chatgpt.com di browser
+2. Buka https://chatgpt.com/api/auth/session
+3. Halaman menampilkan JSON (abaikan banner warning di atasnya)
+4. Ambil:
+   - `accessToken` → jadi `access_token` di config
+   - `sessionToken` → jadi `refresh_token` di config (opsional, untuk auto-refresh)
 
-## Manage Accounts
+Token berlaku terbatas (access token ~10 hari). Kalau expired, ambil ulang dan update config, lalu restart service.
 
-Untuk **tambah akun**, **reset token**, **lihat status**, **stop server**, atau **hapus akun**:
+## Setup Instance Pertama (port 6970)
+
+### 1. Buat config
 
 ```bash
-./manage.sh
+cp config.example.json config.json
+nano config.json
 ```
 
-Menu yang tersedia:
-
-```
-╔══════════════════════════════════════════╗
-║   ChatGPT Web2API - Account Manager      ║
-╚══════════════════════════════════════════╝
-
-   1) ➕ Tambah akun baru
-   2) 🔄 Reset token akun existing
-   3) 📊 Lihat status semua server
-   4) ⛔ Stop semua server
-   5) 🗑️  Hapus akun
-   0) 🚪 Keluar
-```
-
-### Tambah Akun Baru
-1. Run `./manage.sh` → pilih `1`
-2. Script auto-assign port berikutnya (6971, 6972, ...)
-3. Buka `https://chatgpt.com/api/auth/session` (login akun baru)
-4. Ctrl+A → Ctrl+C → Paste → Ctrl+D
-5. Server baru auto-start
-
-### Reset Token (Token Expired)
-1. Run `./manage.sh` → pilih `2`
-2. Pilih akun yang mau di-reset
-3. Buka `https://chatgpt.com/api/auth/session` (login akun itu)
-4. Ctrl+A → Ctrl+C → Paste → Ctrl+D
-5. Server restart dengan token baru
-
-### Lihat Status
-```bash
-./manage.sh
-# Pilih 3
-```
-Output:
-```
-CONFIG             PORT   ACCOUNT              API KEY               STATUS
-------             ----   -------              -------               ------
-config.json        6970   syaf.rie.yunz@gmail  sk-aBcDeFgHiJkLmNoP... 🟢 running
-config-a.json      6971   user2@gmail.com      sk-xYzWvUtSrQpOnMlK... 🟢 running
-config-b.json      6972   user3@gmail.com      sk-qWeRtYuIoPzXcVbN... 🔴 stopped
-```
-
-## Config Format
+Isi:
 
 ```json
 {
   "port": 6970,
   "host": "0.0.0.0",
-  "api_key": "sk-xxxx",
-  "account": {
-    "name": "Your Account Name",
-    "access_token": "eyJhbG...",
-    "refresh_token": "eyJ0eX..."
-  }
+  "api_keys": ["sk-chatgpt"],
+  "access_token": "eyJhbG...dari accessToken",
+  "refresh_token": "eyJhbG...dari sessionToken",
+  "default_model": "gpt-5.6-luna",
+  "impersonate": "safari15_3",
+  "proxy": null
 }
 ```
 
-| Field | Required | Description |
-|---|---|---|
-| `port` | ✅ | Port server (default: 6970) |
-| `host` | ✅ | Bind address (default: 0.0.0.0) |
-| `api_key` | ✅ | Random API key untuk autentikasi client |
-| `account.name` | ✅ | Nama akun (untuk logging) |
-| `account.access_token` | ✅ | Dari `chatgpt.com/api/auth/session` → `accessToken` |
-| `account.refresh_token` | ⬜ | Dari `chatgpt.com/api/auth/session` → `sessionToken` |
+> `api_keys` bebas — ini key yang dipakai client untuk mengakses server Anda.
 
-## Cara Ambil Token Manual
-
-1. Buka `https://chatgpt.com/api/auth/session` di browser
-2. Login ke ChatGPT
-3. Copy semua isi JSON
-4. Extract `accessToken` dan `sessionToken`
-
-Token expire ~3 bulan. Kalau expired, ulangi setup.
-
-## Auto-Start on Boot (systemd)
+### 2. Test jalan manual
 
 ```bash
-# Copy service file
-mkdir -p ~/.config/systemd/user/
-cp chatgpt-web2api.service ~/.config/systemd/user/
+.venv/bin/python3 chatgpt_web2api.py --config config.json --port 6970
+```
 
-# Edit service file untuk path yang benar
+Buka terminal lain:
+
+```bash
+curl http://localhost:6970/health
+```
+
+Kalau muncul `{"status":"ok",...}` berarti jalan. Stop dengan `Ctrl+C`.
+
+### 3. Pasang systemd (auto-start)
+
+```bash
+mkdir -p ~/.config/systemd/user
 nano ~/.config/systemd/user/chatgpt-web2api.service
+```
 
-# Enable & start
+Isi:
+
+```ini
+[Unit]
+Description=ChatGPT Web2API (port 6970)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/chatgpt-web2api
+ExecStart=/home/ubuntu/chatgpt-web2api/.venv/bin/python3 /home/ubuntu/chatgpt-web2api/chatgpt_web2api.py --config /home/ubuntu/chatgpt-web2api/config.json --port 6970
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+```
+
+> Sesuaikan path `/home/ubuntu/chatgpt-web2api` dengan lokasi clone Anda.
+
+Aktifkan:
+
+```bash
 systemctl --user daemon-reload
-systemctl --user enable chatgpt-web2api
-systemctl --user start chatgpt-web2api
-
-# Check status
+systemctl --user enable --now chatgpt-web2api
 systemctl --user status chatgpt-web2api
 ```
 
-## Supported Models
+## Tambah Akun Kedua (port 6971, 6972, ...)
 
-| Model | Description |
-|---|---|
-| `gpt-4o` | GPT-4o |
-| `gpt-4o-mini` | GPT-4o Mini (default) |
-| `gpt-4` | GPT-4 (legacy) |
+Alur sama persis — yang beda cuma **file config**, **port**, dan **nama service**.
+
+### 1. Buat config baru
+
+```bash
+cp config.example.json config-6971.json
+nano config-6971.json
+```
+
+Ganti:
+
+- `"port": 6971`
+- `access_token` / `refresh_token` → token akun kedua (login akun itu dulu di browser, ulangi cara ambil token)
+- `api_keys` → boleh sama atau beda dengan instance pertama
+
+### 2. Buat service baru
+
+```bash
+nano ~/.config/systemd/user/chatgpt-web2api-6971.service
+```
+
+```ini
+[Unit]
+Description=ChatGPT Web2API (port 6971)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/chatgpt-web2api
+ExecStart=/home/ubuntu/chatgpt-web2api/.venv/bin/python3 /home/ubuntu/chatgpt-web2api/chatgpt_web2api.py --config /home/ubuntu/chatgpt-web2api/config-6971.json --port 6971
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+```
+
+### 3. Aktifkan
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now chatgpt-web2api-6971
+```
+
+### 4. Verifikasi
+
+```bash
+ss -ltnp | grep 697
+curl http://localhost:6971/health
+```
+
+Untuk akun ketiga: ulangi dengan `config-6972.json`, port 6972, service `chatgpt-web2api-6972.service`, dst.
+
+## Pakai dari Client (Cherry Studio, ChatBox, dll)
+
+| Field | Instance 1 | Instance 2 |
+|---|---|---|
+| Base URL | `http://localhost:6970/v1` | `http://localhost:6971/v1` |
+| API Key | `api_keys` di `config.json` | `api_keys` di `config-6971.json` |
+
+## Test API
+
+```bash
+curl http://localhost:6970/v1/chat/completions \
+  -H "Authorization: Bearer sk-chatgpt" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.6-luna",
+    "messages": [{"role": "user", "content": "Halo"}],
+    "stream": false
+  }'
+```
+
+Streaming: set `"stream": true` — response berupa SSE.
+
+File attachment (parse lokal): kirim content bertipe `file` dengan `file_data` (data URL) atau `file_url`:
+
+```json
+{
+  "model": "gpt-5.6-luna",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Ringkas file ini"},
+      {"type": "file", "file": {"file_url": "https://example.com/laporan.pdf", "filename": "laporan.pdf"}}
+    ]
+  }]
+}
+```
+
+TXT/PDF/DOCX/XLSX di-extract jadi teks dan disisipkan ke prompt. Gambar (JPG/PNG/GIF/WebP) di-upload sebagai multimodal.
+
+## Config Reference
+
+| Field | Default | Keterangan |
+|---|---|---|
+| `port` | 6970 | Port server |
+| `host` | 0.0.0.0 | Bind address |
+| `api_keys` | [] | Daftar API key untuk autentikasi client (kosong = tanpa auth) |
+| `access_token` | — | `accessToken` dari /api/auth/session |
+| `refresh_token` | — | `sessionToken` dari /api/auth/session (opsional) |
+| `default_model` | gpt-5.6-luna | Model default kalau request tidak menyebut model |
+| `impersonate` | safari15_3 | Browser fingerprint untuk curl_cffi |
+| `proxy` | null | Proxy untuk request ke ChatGPT, mis. `socks5://127.0.0.1:40000` |
+| `history_disabled` | true | Tidak simpan chat ke history akun |
+| `file_mode` | parse | `parse` = extract teks lokal; `upload` = upload file ke ChatGPT |
+| `log_requests` | true | Log request ke stderr/journal |
+| `retry_attempts` | 3 | Retry kalau error transient (429/5xx) |
+| `request_timeout_sec` | 120 | Timeout request ke ChatGPT |
+
+## Models
+
+`gpt-5.6-luna` (default), `gpt-5.5`, `gpt-5.6-luna-mini`, `gpt-5.5-mini`, `gpt-5.3-mini`, `gpt-5.4-t-mini`, `gpt-4o`, `gpt-4o-mini`, `gpt-4`, `gpt-3.5-turbo`, `o1`, `o1-mini`, `o1-preview`, `o3`, `o3-mini`, `o3-mini-high`, `research`, `auto`
+
+Cek daftar live: `curl http://localhost:6970/v1/models`
 
 ## Troubleshooting
 
-### Token Expired
-```
-ERROR: Token refresh failed
-```
-**Solusi:** Ulangi `./setup.sh` dan paste token baru dari `chatgpt.com/api/auth/session`
-
-### Port Sudah Digunakan
-```bash
-fuser -k 6970/tcp
-python3 chatgpt_web2api.py --config config.json
-```
-
-### Dependencies Missing
-```bash
-pip install curl_cffi pybase64 Pillow
-```
+| Masalah | Solusi |
+|---|---|
+| `address already in use` | `fuser -k 6970/tcp` atau ganti port di config + service |
+| 401 token expired | Ambil token baru dari /api/auth/session, update config, `systemctl --user restart <service>` |
+| 403 unusual activity | Request terdeteksi sebagai bot; biasanya sementara. Tunggu 1–2 jam, pastikan tidak pakai proxy yang di-flag, atau ganti IP |
+| Log service | `journalctl --user -u chatgpt-web2api -f` |
+| Dependencies | `.venv/bin/pip install -r requirements.txt` |
 
 ## ⚠️ Security
 
-- **Jangan commit `config.json` ke git** (sudah ada di `.gitignore`)
-- `config.json` berisi token sensitive, jangan share
-- API key di config = akses ke server Anda, jangan share
-- Token expire ~3 bulan, rotate regularly
+- **Jangan commit `config*.json`** — sudah ada di `.gitignore`
+- Config berisi token sensitif, jangan share
+- `api_keys` = akses ke server Anda. Kalau host `0.0.0.0`, pastikan pakai API key dan/atau firewall
+- Rotate token secara berkala
 
 ## License
 
