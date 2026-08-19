@@ -69,14 +69,14 @@ paste_and_parse() {
     
     echo ""
     echo -e "${C}┌──────────────────────────────────────────────┐${N}"
-    echo -e "${C}│  PASTE JSON (paste, lalu tunggu 3 detik)      │${N}"
+    echo -e "${C}│  PASTE JSON (paste, lalu tunggu 10 detik)     │${N}"
     echo -e "${C}│  ATAU: ./manage.sh /path/to/session.json      │${N}"
     echo -e "${C}└──────────────────────────────────────────────┘${N}"
     echo ""
     
     local tmp="/tmp/chatgpt_session_$$"
     
-    # Read stdin with 3-second timeout (bypasses SSH 4096 byte paste limit)
+    # Read stdin with 10-second timeout (bypasses SSH 4096 byte paste limit)
     python3 -c "
 import sys, os, select
 

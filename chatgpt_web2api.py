@@ -81,7 +81,7 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "history_disabled": True,
     "pow_difficulty": "0fffff",
-    "impersonate": "safari15_3",
+    "impersonate": "chrome131",
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -130,7 +130,7 @@ _cached_scripts = []
 _cached_dpl = ""
 _cached_dpl_time = 0
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -420,6 +420,13 @@ def _base_headers(access_token):
         "origin": "https://chatgpt.com",
         "referer": "https://chatgpt.com/",
         "user-agent": UA,
+        "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "oai-language": "en-US",
     }
     if access_token:
         h["authorization"] = f"Bearer {access_token}"
