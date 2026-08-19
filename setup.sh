@@ -155,8 +155,8 @@ if len(access_token) < 500:
 if len(refresh_token) < 500:
     print(f"   ⚠ WARNING: SessionToken seems short ({len(refresh_token)} chars)")
 
-# Generate random API key
-api_key = "sk-" + ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+# Generate default API key (user can override manually)
+api_key = "sk-chatgpt"
 
 config = {
     "port": 6970,
@@ -202,20 +202,38 @@ echo ""
 # ─── Step 4: Start server ────────────────────
 echo -e "${Y}[4/4] Starting server on port 6970...${N}"
 
+# Kill existing server and WAIT for port to be free
 fuser -k 6970/tcp 2>/dev/null || true
-sleep 1
+for i in {1..10}; do
+    if ! lsof -i :6970 > /dev/null 2>&1; then
+        break
+    fi
+    echo "   Waiting for port 6970 to be free... ($i/10)"
+    sleep 1
+done
+
+if lsof -i :6970 > /dev/null 2>&1; then
+    echo -e "${R}   ✗ Port 6970 still in use after 10s. Kill manually: fuser -k 6970/tcp${N}"
+    exit 1
+fi
 
 cd "$SCRIPT_DIR"
-nohup .venv/bin/python3 chatgpt_web2api.py --config config.json > /tmp/chatgpt-web2api.log 2>&1 &
+.venv/bin/python3 chatgpt_web2api.py --config config.json > /tmp/chatgpt-web2api.log 2>&1 &
 SERVER_PID=$!
-sleep 3
 
-if curl -s http://localhost:6970/ > /dev/null 2>&1; then
-    echo -e "${G}   ✓ Server running on port 6970 (PID: $SERVER_PID)${N}"
-else
-    echo -e "${R}   ⚠ Server may have issues. Check log:${N}"
-    echo "   tail -20 /tmp/chatgpt-web2api.log"
-fi
+# Wait for server to be ready (max 15s)
+for i in {1..15}; do
+    if curl -s http://localhost:6970/ > /dev/null 2>&1; then
+        echo -e "${G}   ✓ Server running on port 6970 (PID: $SERVER_PID)${N}"
+        break
+    fi
+    if [ $i -eq 15 ]; then
+        echo -e "${R}   ✗ Server failed to start. Check log:${N}"
+        echo "   tail -20 /tmp/chatgpt-web2api.log"
+        exit 1
+    fi
+    sleep 1
+done
 
 echo ""
 echo -e "${G}╔══════════════════════════════════════════╗${N}"

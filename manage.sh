@@ -163,7 +163,7 @@ if old_path.exists():
         old_apikey = old.get('api_key', '')
     except: pass
 
-api_key = old_apikey if old_apikey else "sk-" + ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+api_key = old_apikey if old_apikey else "sk-chatgpt"
 
 config = {
     "port": port,
@@ -199,27 +199,45 @@ start_server() {
     local config_file="$1"
     local port=$(python3 -c "import json; print(json.load(open('$config_file')).get('port',6970))" 2>/dev/null)
     
-    # Kill existing process on that port
+    # Kill existing process on that port and WAIT for port to be free
     fuser -k "$port/tcp" 2>/dev/null || true
-    sleep 1
+    local i
+    for i in {1..10}; do
+        if ! lsof -i ":$port" > /dev/null 2>&1; then
+            break
+        fi
+        echo "   Waiting for port $port to be free... ($i/10)"
+        sleep 1
+    done
     
-    # Start server
+    if lsof -i ":$port" > /dev/null 2>&1; then
+        echo -e "${R}   ✗ Port $port still in use after 10s. Kill manually: fuser -k $port/tcp${N}"
+        return 1
+    fi
+    
+    # Start server (not nohup — parent script stays alive)
     if [ -d "$SCRIPT_DIR/.venv" ]; then
         PYTHON="$SCRIPT_DIR/.venv/bin/python3"
     else
         PYTHON="python3"
     fi
     
-    nohup $PYTHON "$SCRIPT_DIR/chatgpt_web2api.py" --config "$config_file" \
+    $PYTHON "$SCRIPT_DIR/chatgpt_web2api.py" --config "$config_file" \
         > "/tmp/chatgpt-web2api-$port.log" 2>&1 &
     local pid=$!
-    sleep 2
     
-    if curl -s --max-time 2 "http://localhost:$port/" > /dev/null 2>&1; then
-        echo -e "${G}🟢 Server running on port $port (PID: $pid)${N}"
-    else
-        echo -e "${R}🔴 Server failed to start. Check: tail -20 /tmp/chatgpt-web2api-$port.log${N}"
-    fi
+    # Wait for server to be ready (max 15s)
+    for i in {1..15}; do
+        if curl -s --max-time 2 "http://localhost:$port/" > /dev/null 2>&1; then
+            echo -e "${G}🟢 Server running on port $port (PID: $pid)${N}"
+            return 0
+        fi
+        if [ $i -eq 15 ]; then
+            echo -e "${R}🔴 Server failed to start. Check: tail -20 /tmp/chatgpt-web2api-$port.log${N}"
+            return 1
+        fi
+        sleep 1
+    done
 }
 
 # ─── Menu Actions ────────────────────────────
